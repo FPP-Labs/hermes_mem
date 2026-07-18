@@ -673,6 +673,13 @@ class MemoryStore:
         data = _row_to_dict(row)
         data["aliases"] = [str(item) for item in _loads_list(data.pop("aliases_json", "[]")) if str(item).strip()]
         data["metadata"] = _loads(data.pop("metadata_json", "{}"))
+        data["linked_event_ids"] = [
+            linked["event_id"]
+            for linked in self.conn.execute(
+                "SELECT event_id FROM chat_event_links WHERE chat_id = ? ORDER BY created_at, id",
+                (data["id"],),
+            ).fetchall()
+        ]
         return data
 
     def upsert_chat_session(
@@ -745,26 +752,32 @@ class MemoryStore:
                 (session_id, title.strip(), " ".join(clean_aliases), summary.strip()),
             )
 
-        linked_events = []
         for event_id in event_ids or []:
-            if event_id and self.link_chat_to_event(session_id, event_id, commit=False):
-                linked_events.append(event_id)
+            if event_id:
+                self.link_chat_to_event(session_id, event_id, at=now, commit=False)
         self.conn.commit()
-        session = self.get_chat_session(session_id)
-        session["linked_event_ids"] = linked_events
-        return session
+        return self.get_chat_session(session_id, at=now)
 
-    def get_chat_session(self, chat_id: str) -> dict[str, Any]:
+    def get_chat_session(self, chat_id: str, *, at: str | None = None) -> dict[str, Any]:
+        current = parse_datetime(at, self.zone).isoformat(timespec="seconds") if at else iso_now(self.zone)
         row = self.conn.execute(
             "SELECT * FROM chat_sessions WHERE id = ? AND deleted_at IS NULL AND expires_at >= ?",
-            (chat_id, iso_now(self.zone)),
+            (chat_id, current),
         ).fetchone()
         if row is None:
             raise KeyError(f"chat session not found: {chat_id}")
         return self._chat_row_to_dict(row)
 
-    def link_chat_to_event(self, chat_id: str, event_id: str, *, note: str = "", commit: bool = True) -> bool:
-        self.get_chat_session(chat_id)
+    def link_chat_to_event(
+        self,
+        chat_id: str,
+        event_id: str,
+        *,
+        note: str = "",
+        at: str | None = None,
+        commit: bool = True,
+    ) -> bool:
+        self.get_chat_session(chat_id, at=at)
         self.get_event(event_id)
         now = iso_now(self.zone)
         try:
@@ -834,7 +847,7 @@ class MemoryStore:
             "text": clean_text,
             "note_type": note_type,
             "created_at": created_at,
-            "chat": self.get_chat_session(session["id"]),
+            "chat": self.get_chat_session(session["id"], at=created_at),
         }
 
     def list_chat_sessions(self, *, limit: int = 20, include_deleted: bool = False) -> list[dict[str, Any]]:

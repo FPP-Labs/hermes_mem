@@ -13,14 +13,29 @@ HERMES_ROOT="${HERMES_ROOT:-"$HERMES_HOME/hermes-agent"}"
 DEFAULT_ELEVENLABS_MODEL_ID="${ELEVENLABS_MODEL_ID:-eleven_multilingual_v2}"
 ARG_COUNT="$#"
 
+OS_NAME="${AI_MEMORY_PLATFORM:-$(uname -s)}"
+case "$OS_NAME" in
+  Darwin) PLATFORM="macos" ;;
+  Linux) PLATFORM="linux" ;;
+  *)
+    printf 'ERROR: unsupported operating system: %s\n' "$OS_NAME" >&2
+    exit 1
+    ;;
+esac
+
+# A fresh official Hermes install writes its launchers and managed runtimes to
+# these directories. Keep them available in this process without requiring a
+# shell restart on Linux or macOS.
+export PATH="$HOME/.local/bin:$HERMES_ROOT/venv/bin:$HERMES_HOME/node/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 MODE="install"
 PACK_PATH=""
 INSTALL_DEPS=1
 INSTALL_HERMES=1
 CONFIGURE_HERMES=1
 DISABLE_HERMES_BUILTIN_MEMORY=1
-CONFIGURE_ELEVENLABS=1
-CONFIGURE_WEB_SEARCH=1
+CONFIGURE_ELEVENLABS=0
+CONFIGURE_WEB_SEARCH=0
 BACKUP_HERMES_CONFIG=1
 APPLY_HERMES_DESKTOP_UI=1
 BUILD_HERMES_DESKTOP_UI=1
@@ -28,29 +43,26 @@ WEB_SEARCH_ENABLED=0
 
 usage() {
   cat <<EOF
-Install ai-memory-mcp into ~/.ai_memory and optionally connect it to Hermes.
+Install Hermes FPP on Linux or macOS.
 
 Usage:
-  ./install.sh [options]
+  ./install.sh                       Install or update; keep memory
+  ./install.sh update                Update/repair; keep memory
+  ./install.sh doctor                Check Hermes FPP
+  ./install.sh backup                Create a portable memory backup
+  ./install.sh restore PATH          Restore a memory backup
+  ./install.sh desktop               Rebuild and install FPP Desktop only
+  ./install.sh reset-memory          Erase memory and reinstall FPP
+  ./install.sh uninstall             Remove Hermes FPP and all user data
 
-Main modes:
-  -reinstall                  Reinstall ai-memory-mcp, skip Hermes install, erase memory
-  -reinstallsoft              Repair/update ai-memory-mcp, skip Hermes install, keep memory
-  -pak                        Create a memory pack archive in ~/.ai_memory
-  -unpak PATH                 Restore memory from a pack archive into ~/.ai_memory
-  -patchui                    Apply the Hermes Desktop FPP UI patch and rebuild Desktop
-  -doctor, -check             Check installation integrity without reinstalling
-  -uninstall                  Remove ai-memory, Hermes Agent, Desktop UI, config, and data
-  -menu                       Show interactive installer menu
-
-Options:
-  --no-deps                   Do not install OS packages
+Advanced options:
+  --no-deps                   Do not install missing Git/curl prerequisites
   --no-install-hermes         Do not install Hermes Agent
   --no-hermes                 Do not configure Hermes MCP
   --keep-hermes-builtin-memory
                               Keep Hermes built-in MEMORY.md/USER.md enabled
-  --no-web-search             Do not ask for web search settings
-  --no-elevenlabs             Do not ask for ElevenLabs TTS settings
+  --configure-web-search      Configure web search in the terminal
+  --configure-elevenlabs      Configure ElevenLabs in the terminal
   --no-hermes-config-backup   Do not back up current Hermes config files
   --no-desktop-ui             Do not patch Hermes Desktop UI
   --no-desktop-ui-build       Patch Desktop source but do not rebuild the launchable app
@@ -69,11 +81,14 @@ Environment:
   HERMES_MCP_ADD_TIMEOUT_SECONDS=seconds
                               Default: 180; timeout for Hermes MCP validation
   AI_MEMORY_UNINSTALL_CONFIRM=DELETE
-                              Confirm -uninstall in a non-interactive shell
+                              Confirm uninstall/reset in a non-interactive shell
 
 Notes:
-  Normal install does not auto-import old databases. Use -unpak PATH to restore
-  a memory pack, or copy memory.sqlite3 manually before starting Hermes.
+  Normal install and update always preserve memory. Optional web-search and
+  ElevenLabs keys can be configured later in Hermes/FPP settings.
+
+Legacy aliases (-reinstallsoft, -reinstall, -pak, -unpak, -patchui, -check)
+remain accepted for existing users.
 EOF
 }
 
@@ -96,24 +111,26 @@ set_mode() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -reinstall)
-      set_mode "reinstall"
-      INSTALL_HERMES=0
+    install)
       ;;
-    -reinstallsoft)
+    update|-reinstallsoft)
       set_mode "reinstallsoft"
       INSTALL_HERMES=0
       ;;
-    -pak)
+    reset-memory|-reinstall)
+      set_mode "reinstall"
+      INSTALL_HERMES=0
+      ;;
+    backup|-pak)
       set_mode "pack"
       ;;
-    -unpak)
+    restore|-unpak)
       set_mode "unpack"
       shift
-      [ "$#" -gt 0 ] || die "-unpak needs a pack path"
+      [ "$#" -gt 0 ] || die "restore needs a backup path"
       PACK_PATH="$1"
       ;;
-    -patchui)
+    desktop|-patchui)
       set_mode "patchui"
       INSTALL_DEPS=0
       INSTALL_HERMES=0
@@ -122,7 +139,7 @@ while [ "$#" -gt 0 ]; do
       CONFIGURE_WEB_SEARCH=0
       BACKUP_HERMES_CONFIG=0
       ;;
-    -doctor|-check|-integrity)
+    doctor|-doctor|-check|-integrity)
       set_mode "doctor"
       INSTALL_DEPS=0
       INSTALL_HERMES=0
@@ -131,7 +148,7 @@ while [ "$#" -gt 0 ]; do
       BACKUP_HERMES_CONFIG=0
       BUILD_HERMES_DESKTOP_UI=0
       ;;
-    -uninstall|--uninstall)
+    uninstall|-uninstall|--uninstall)
       set_mode "uninstall"
       INSTALL_DEPS=0
       INSTALL_HERMES=0
@@ -160,8 +177,14 @@ while [ "$#" -gt 0 ]; do
     --no-web-search)
       CONFIGURE_WEB_SEARCH=0
       ;;
+    --configure-web-search)
+      CONFIGURE_WEB_SEARCH=1
+      ;;
     --no-elevenlabs)
       CONFIGURE_ELEVENLABS=0
+      ;;
+    --configure-elevenlabs)
+      CONFIGURE_ELEVENLABS=1
       ;;
     --no-hermes-config-backup)
       BACKUP_HERMES_CONFIG=0
@@ -193,7 +216,7 @@ This installer sets up:
   2. ai-memory MCP in ~/.ai_memory
   3. Hermes MCP config
   4. Hermes SOUL prompt with memory, search, and YouTube rules
-  5. Optional web search and ElevenLabs settings
+  5. Web search and ElevenLabs support (configured later in Desktop)
   6. Clean Hermes Desktop UI
   7. Desktop app launcher
 
@@ -204,39 +227,37 @@ show_menu() {
   show_welcome
   cat <<EOF
 Choose an action:
-  1) Install
-  2) Reinstall and erase memory
-  3) Repair/update and keep memory
-  4) Check integrity
-  5) Patch Hermes Desktop UI only
-  6) Pack memory
-  7) Unpack memory
-  8) Uninstall everything
-  9) Exit
+  1) Install/update and keep memory
+  2) Check integrity
+  3) Rebuild Desktop UI
+  4) Backup memory
+  5) Restore memory
+  6) Reset memory
+  7) Uninstall everything
+  8) Exit
 
 EOF
-  printf 'Select [1-9]: '
+  printf 'Select [1-8]: '
   local choice
   IFS= read -r choice
   case "$choice" in
     1|"") MODE="install" ;;
-    2) MODE="reinstall"; INSTALL_HERMES=0 ;;
-    3) MODE="reinstallsoft"; INSTALL_HERMES=0 ;;
-    4) MODE="doctor"; INSTALL_DEPS=0; INSTALL_HERMES=0; CONFIGURE_ELEVENLABS=0; CONFIGURE_WEB_SEARCH=0; BACKUP_HERMES_CONFIG=0; BUILD_HERMES_DESKTOP_UI=0 ;;
-    5) MODE="patchui"; INSTALL_DEPS=0; INSTALL_HERMES=0; CONFIGURE_HERMES=0; CONFIGURE_ELEVENLABS=0; CONFIGURE_WEB_SEARCH=0; BACKUP_HERMES_CONFIG=0 ;;
-    6) MODE="pack" ;;
-    7)
+    2) MODE="doctor"; INSTALL_DEPS=0; INSTALL_HERMES=0; BACKUP_HERMES_CONFIG=0; BUILD_HERMES_DESKTOP_UI=0 ;;
+    3) MODE="patchui"; INSTALL_DEPS=0; INSTALL_HERMES=0; CONFIGURE_HERMES=0; BACKUP_HERMES_CONFIG=0 ;;
+    4) MODE="pack" ;;
+    5)
       MODE="unpack"
-      printf 'Pack path: '
+      printf 'Backup path: '
       IFS= read -r PACK_PATH
       ;;
-    8) MODE="uninstall"; INSTALL_DEPS=0; INSTALL_HERMES=0; CONFIGURE_HERMES=0; CONFIGURE_ELEVENLABS=0; CONFIGURE_WEB_SEARCH=0; BACKUP_HERMES_CONFIG=0; APPLY_HERMES_DESKTOP_UI=0; BUILD_HERMES_DESKTOP_UI=0 ;;
-    9) exit 0 ;;
+    6) MODE="reinstall"; INSTALL_HERMES=0 ;;
+    7) MODE="uninstall"; INSTALL_DEPS=0; INSTALL_HERMES=0; CONFIGURE_HERMES=0; BACKUP_HERMES_CONFIG=0; APPLY_HERMES_DESKTOP_UI=0; BUILD_HERMES_DESKTOP_UI=0 ;;
+    8) exit 0 ;;
     *) die "unknown menu choice: $choice" ;;
   esac
 }
 
-if [ "$MODE" = "menu" ] || { [ "$ARG_COUNT" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; }; then
+if [ "$MODE" = "menu" ]; then
   show_menu
 fi
 
@@ -261,44 +282,40 @@ install_deps() {
     return
   fi
 
-  if [ -f /etc/os-release ] && grep -qi '^ID=nixos' /etc/os-release; then
-    log "NixOS detected; checking dependencies instead of mutating system packages"
-    local missing=()
-    for bin in python3 git curl rg ffmpeg; do
-      command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
-    done
-    if [ "${#missing[@]}" -gt 0 ]; then
-      die "missing dependencies on NixOS: ${missing[*]}. Install them in your Nix profile/shell, then rerun with --no-deps."
-    fi
-  elif command -v apt-get >/dev/null 2>&1; then
-    log "Installing dependencies with apt"
-    sudo_cmd apt-get update
-    sudo_cmd apt-get install -y python3 python3-venv python3-pip git curl ca-certificates ripgrep ffmpeg
-  elif command -v dnf >/dev/null 2>&1; then
-    log "Installing dependencies with dnf"
-    sudo_cmd dnf install -y python3 python3-pip git curl ca-certificates ripgrep ffmpeg
-  elif command -v pacman >/dev/null 2>&1; then
-    local packages=(python python-pip git curl ca-certificates ripgrep ffmpeg)
-    local missing=()
-    local package
-    for package in "${packages[@]}"; do
-      pacman -Q "$package" >/dev/null 2>&1 || missing+=("$package")
-    done
+  # Hermes' official cross-platform bootstrap owns Python, uv, Node, ripgrep,
+  # ffmpeg, Playwright, and native build dependencies. Duplicating that logic
+  # here created most of the old installer's questions and distro branches.
+  # Hermes FPP only needs Git and curl in order to invoke that bootstrap.
+  local missing=()
+  local bin
+  for bin in git curl; do
+    command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then
+    log "Base prerequisites are ready ($PLATFORM)"
+    return
+  fi
 
-    if [ "${#missing[@]}" -eq 0 ]; then
-      log "All pacman dependencies are already installed"
+  if [ "$PLATFORM" = "macos" ]; then
+    if command -v brew >/dev/null 2>&1; then
+      log "Installing missing prerequisites with Homebrew: ${missing[*]}"
+      brew install "${missing[@]}"
       return
     fi
+    die "missing prerequisites: ${missing[*]}. Install Xcode Command Line Tools (xcode-select --install) or Homebrew, then rerun."
+  fi
 
-    log "Updating Arch Linux and installing missing dependencies: ${missing[*]}"
-    if ! sudo_cmd pacman -Syu --needed --noconfirm "${missing[@]}"; then
-      die "pacman could not complete a full system upgrade. Run 'sudo pacman -Syu', resolve any package conflicts, then rerun this installer."
-    fi
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo_cmd apt-get update
+    sudo_cmd apt-get install -y "${missing[@]}"
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo_cmd dnf install -y "${missing[@]}"
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo_cmd pacman -Syu --needed --noconfirm "${missing[@]}"
   elif command -v emerge >/dev/null 2>&1; then
-    log "Installing dependencies with emerge"
-    sudo_cmd emerge --ask=n dev-lang/python dev-python/pip dev-vcs/git net-misc/curl app-misc/ca-certificates sys-apps/ripgrep media-video/ffmpeg
+    sudo_cmd emerge --ask=n "${missing[@]}"
   else
-    die "unsupported distro: install Python >=3.11, venv, pip, git, curl, ripgrep, and ffmpeg manually; then rerun with --no-deps"
+    die "missing prerequisites: ${missing[*]}. Install them and rerun with --no-deps."
   fi
 }
 
@@ -312,12 +329,30 @@ install_hermes() {
   fi
   command -v curl >/dev/null 2>&1 || die "curl is required to install Hermes"
 
-  log "Installing Hermes Agent"
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+  log "Installing Hermes Agent with the official $PLATFORM bootstrap"
+  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup
+  hash -r
+  command -v hermes >/dev/null 2>&1 || die "Hermes installed but its launcher was not found in $PATH"
+}
+
+ensure_macos_browser_runtime() {
+  [ "$PLATFORM" = "macos" ] || return 0
+  [ -d "$HERMES_ROOT" ] || return 0
+  if [ -d "$HOME/Library/Caches/ms-playwright" ] && \
+    find "$HOME/Library/Caches/ms-playwright" -maxdepth 2 -type f -name INSTALLATION_COMPLETE -print -quit 2>/dev/null | grep -q .; then
+    log "Playwright Chromium is ready"
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    log "npx not found; browser runtime will be installed by Hermes on first use"
+    return 0
+  fi
+  log "Ensuring Playwright Chromium is installed for native macOS browser tools"
+  (cd "$HERMES_ROOT" && npx playwright install chromium)
 }
 
 find_python() {
-  for python_bin in python3.13 python3.12 python3.11 python3; do
+  for python_bin in "$HERMES_ROOT/venv/bin/python" python3.13 python3.12 python3.11 python3; do
     if command -v "$python_bin" >/dev/null 2>&1; then
       if "$python_bin" - <<'PY' >/dev/null 2>&1; then
 import sys
@@ -353,6 +388,10 @@ copy_source() {
 }
 
 write_config() {
+  if [ -f "$CONFIG_PATH" ]; then
+    log "Keeping existing memory config: $CONFIG_PATH"
+    return
+  fi
   log "Writing config to $CONFIG_PATH"
   mkdir -p "$APP_DIR"
   cat > "$CONFIG_PATH" <<EOF
@@ -403,8 +442,33 @@ PY
 }
 
 erase_memory() {
+  if [ "${AI_MEMORY_RESET_CONFIRM:-${AI_MEMORY_UNINSTALL_CONFIRM:-}}" != "DELETE" ]; then
+    [ -t 0 ] || die "non-interactive reset requires AI_MEMORY_RESET_CONFIRM=DELETE"
+    printf 'Type DELETE to erase all Hermes FPP memory: '
+    local answer
+    IFS= read -r answer
+    [ "$answer" = "DELETE" ] || die "memory reset cancelled"
+  fi
   log "Erasing memory database"
   rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  local python_bin="$VENV_DIR/bin/python"
+  if [ ! -x "$python_bin" ]; then
+    python_bin="$(find_python)"
+  fi
+  "$python_bin" -c '
+import subprocess, sys
+timeout = float(sys.argv[1])
+try:
+    result = subprocess.run(sys.argv[2:], stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, timeout=timeout)
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+raise SystemExit(result.returncode)
+' "$seconds" "$@"
 }
 
 configure_hermes() {
@@ -422,15 +486,9 @@ configure_hermes() {
   log "Configuring Hermes MCP server: $SERVER_NAME"
   log "Hermes may take up to ${mcp_timeout}s to validate MCP tools"
   hermes mcp remove "$SERVER_NAME" >/dev/null 2>&1 || true
-  if command -v timeout >/dev/null 2>&1; then
-    printf 'Y\n' | timeout "${mcp_timeout}s" hermes mcp add "$SERVER_NAME" \
-      --command "$VENV_DIR/bin/ai-memory-mcp" \
-      --args --config "$CONFIG_PATH" serve || die "Hermes MCP validation timed out or failed"
-  else
-    printf 'Y\n' | hermes mcp add "$SERVER_NAME" \
-      --command "$VENV_DIR/bin/ai-memory-mcp" \
-      --args --config "$CONFIG_PATH" serve
-  fi
+  printf 'Y\n' | run_with_timeout "$mcp_timeout" hermes mcp add "$SERVER_NAME" \
+    --command "$VENV_DIR/bin/ai-memory-mcp" \
+    --args --config "$CONFIG_PATH" serve || die "Hermes MCP validation timed out or failed"
 
   if [ "$DISABLE_HERMES_BUILTIN_MEMORY" -eq 1 ]; then
     log "Disabling Hermes built-in MEMORY.md/USER.md injection"
@@ -634,7 +692,7 @@ configure_web_search() {
       provider="$(trim_spaces "$provider")"
     fi
     provider="${provider:-tavily}"
-    provider="${provider,,}"
+    provider="$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')"
     env_key="$(web_provider_env_key "$provider")" || die "unsupported web search provider: $provider"
     backend="$(web_provider_backend "$provider")"
 
@@ -850,12 +908,7 @@ apply_hermes_desktop_ui() {
   fi
 }
 
-install_desktop_entry() {
-  if ! command -v hermes >/dev/null 2>&1; then
-    log "Hermes command not found; skipping desktop launcher"
-    return
-  fi
-
+install_linux_desktop_entry() {
   local apps_dir icon_src icon_value desktop_file launcher_file desktop_app log_file
   apps_dir="$HOME/.local/share/applications"
   desktop_file="$apps_dir/hermes-fpp.desktop"
@@ -921,10 +974,62 @@ EOF
   fi
 }
 
+find_macos_desktop_app() {
+  local release_dir="$HERMES_ROOT/apps/desktop/release"
+  [ -d "$release_dir" ] || return 1
+  find "$release_dir" -maxdepth 4 -type d -name 'Hermes.app' -print 2>/dev/null | head -n 1
+}
+
+install_macos_desktop_entry() {
+  local source_app destination_app staged_app launcher_file
+  source_app="$(find_macos_desktop_app || true)"
+  if [ -z "$source_app" ]; then
+    if [ "$BUILD_HERMES_DESKTOP_UI" -eq 1 ] || [ "$MODE" = "patchui" ]; then
+      die "macOS Hermes.app was not produced under $HERMES_ROOT/apps/desktop/release"
+    fi
+    log "macOS Desktop build not found; skipping app installation"
+    return
+  fi
+
+  destination_app="$HOME/Applications/Hermes FPP.app"
+  staged_app="$HOME/Applications/.Hermes FPP.app.new.$$"
+  launcher_file="$HOME/.local/bin/hermes-fpp-desktop"
+  mkdir -p "$HOME/Applications" "$HOME/.local/bin"
+
+  log "Installing native macOS app: $destination_app"
+  rm -rf -- "$staged_app"
+  ditto "$source_app" "$staged_app"
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign - "$staged_app" >/dev/null 2>&1 || \
+      log "Ad-hoc code signing failed; macOS may ask for confirmation on first launch"
+  fi
+  rm -rf -- "$destination_app"
+  mv "$staged_app" "$destination_app"
+
+  cat > "$launcher_file" <<EOF
+#!/usr/bin/env bash
+set -e
+exec open "$destination_app" --args "\$@"
+EOF
+  chmod +x "$launcher_file"
+}
+
+install_desktop_entry() {
+  if ! command -v hermes >/dev/null 2>&1; then
+    log "Hermes command not found; skipping desktop launcher"
+    return
+  fi
+  if [ "$PLATFORM" = "macos" ]; then
+    install_macos_desktop_entry
+  else
+    install_linux_desktop_entry
+  fi
+}
+
 doctor() {
   local failed=0
 
-  log "Checking files"
+  log "Checking Hermes FPP on $PLATFORM ($(uname -m))"
   [ -d "$APP_DIR" ] || { printf 'FAIL app dir missing: %s\n' "$APP_DIR"; failed=1; }
   [ -d "$CODE_DIR" ] || { printf 'FAIL code dir missing: %s\n' "$CODE_DIR"; failed=1; }
   [ -x "$VENV_DIR/bin/ai-memory-mcp" ] || { printf 'FAIL MCP executable missing: %s\n' "$VENV_DIR/bin/ai-memory-mcp"; failed=1; }
@@ -936,7 +1041,10 @@ doctor() {
     "$VENV_DIR/bin/ai-memory-mcp" --config "$CONFIG_PATH" doctor
   fi
 
-  if command -v hermes >/dev/null 2>&1 && [ "$CONFIGURE_HERMES" -eq 1 ]; then
+  if ! command -v hermes >/dev/null 2>&1; then
+    printf 'FAIL Hermes command not found\n'
+    failed=1
+  elif [ "$CONFIGURE_HERMES" -eq 1 ]; then
     log "Hermes MCP config"
     hermes mcp list
   fi
@@ -947,10 +1055,22 @@ doctor() {
     printf 'WARN Hermes Desktop FPP settings patch not found\n'
   fi
 
-  if [ -f "$HOME/.local/share/applications/hermes-fpp.desktop" ]; then
-    printf 'OK desktop launcher found\n'
+  if [ "$PLATFORM" = "macos" ]; then
+    local mac_app="$HOME/Applications/Hermes FPP.app"
+    if [ -x "$mac_app/Contents/MacOS/Hermes" ]; then
+      if command -v codesign >/dev/null 2>&1 && ! codesign --verify --deep --strict "$mac_app" >/dev/null 2>&1; then
+        printf 'FAIL native macOS app has an invalid signature: %s\n' "$mac_app"
+        failed=1
+      else
+        printf 'OK native macOS app found and verified\n'
+      fi
+    else
+      printf 'WARN native macOS app not found\n'
+    fi
+  elif [ -f "$HOME/.local/share/applications/hermes-fpp.desktop" ]; then
+    printf 'OK Linux desktop launcher found\n'
   else
-    printf 'WARN desktop launcher not found\n'
+    printf 'WARN Linux desktop launcher not found\n'
   fi
 
   [ "$failed" -eq 0 ] || exit 1
@@ -972,8 +1092,8 @@ pack_memory() {
 
 unpack_memory() {
   require_existing_install
-  [ -n "$PACK_PATH" ] || die "-unpak needs a pack path"
-  [ -f "$PACK_PATH" ] || die "pack not found: $PACK_PATH"
+  [ -n "$PACK_PATH" ] || die "restore needs a backup path"
+  [ -f "$PACK_PATH" ] || die "backup not found: $PACK_PATH"
 
   log "Restoring memory pack: $PACK_PATH"
   rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"
@@ -985,6 +1105,7 @@ unpack_memory() {
 install_flow() {
   install_deps
   install_hermes
+  ensure_macos_browser_runtime
   copy_source
   write_config
   install_python_package
@@ -1002,6 +1123,7 @@ reinstall_flow() {
   require_existing_install
   INSTALL_HERMES=0
   log "Reinstalling ai-memory-mcp and erasing memory"
+  ensure_macos_browser_runtime
   rm -rf "$CODE_DIR" "$VENV_DIR"
   write_config
   erase_memory
@@ -1021,6 +1143,7 @@ reinstall_soft_flow() {
   require_existing_install
   INSTALL_HERMES=0
   log "Repairing/updating ai-memory-mcp and keeping memory"
+  ensure_macos_browser_runtime
   rm -rf "$CODE_DIR"
   write_config
   copy_source
@@ -1046,7 +1169,11 @@ safe_remove_path() {
   [ -n "$path" ] || die "refusing to remove an empty path"
 
   local resolved
-  resolved="$(realpath -m -- "$path")"
+  if command -v python3 >/dev/null 2>&1; then
+    resolved="$(python3 -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$path")"
+  else
+    resolved="$(cd "$(dirname "$path")" 2>/dev/null && printf '%s/%s\n' "$PWD" "$(basename "$path")")"
+  fi
 
   case "$resolved" in
     /|"$HOME")
@@ -1061,6 +1188,7 @@ safe_remove_path() {
 }
 
 remove_hermes_services() {
+  [ "$PLATFORM" = "linux" ] || return 0
   local unit unit_name
   local user_units=(
     "$HOME/.config/systemd/user/hermes-gateway"*.service
@@ -1088,7 +1216,7 @@ remove_hermes_launcher() {
 
   if [ -L "$launcher" ]; then
     local target
-    target="$(readlink -f "$launcher" 2>/dev/null || true)"
+    target="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$launcher" 2>/dev/null || true)"
     case "$target" in
       "$HERMES_HOME"/*|"$HERMES_ROOT"/*)
         log "Removing Hermes launcher: $launcher"
@@ -1109,7 +1237,7 @@ remove_hermes_node_links() {
   for name in node npm npx; do
     link="$HOME/.local/bin/$name"
     [ -L "$link" ] || continue
-    target="$(readlink -f "$link" 2>/dev/null || true)"
+    target="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$link" 2>/dev/null || true)"
     case "$target" in
       "$HERMES_HOME/node"/*)
         log "Removing Hermes-managed link: $link"
@@ -1129,6 +1257,10 @@ WARNING: complete uninstall will permanently delete:
   $HOME/.cache/Hermes
   $HOME/.cache/ms-playwright
   $HOME/.local/share/applications/hermes-fpp.desktop
+  $HOME/Applications/Hermes FPP.app
+  $HOME/Library/Application Support/Hermes
+  $HOME/Library/Caches/Hermes
+  $HOME/Library/Caches/ms-playwright
   Hermes launcher, managed Node links, Desktop data, sessions, keys, and memory
 
 The project source directory will be kept:
@@ -1169,7 +1301,15 @@ uninstall_everything() {
   safe_remove_path "$HOME/.cache/Hermes"
   safe_remove_path "$HOME/.cache/ms-playwright"
 
+  if [ "$PLATFORM" = "macos" ]; then
+    safe_remove_path "$HOME/Applications/Hermes FPP.app"
+    safe_remove_path "$HOME/Library/Application Support/Hermes"
+    safe_remove_path "$HOME/Library/Caches/Hermes"
+    safe_remove_path "$HOME/Library/Caches/ms-playwright"
+  fi
+
   rm -f -- \
+    "$HOME/.local/bin/hermes-fpp-desktop" \
     "$HOME/.local/share/applications/hermes-fpp.desktop" \
     "$HOME/.local/share/applications/hermes.desktop" \
     "$HOME/.local/share/applications/Hermes.desktop"

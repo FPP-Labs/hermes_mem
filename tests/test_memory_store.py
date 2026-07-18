@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from ai_memory_mcp.config import MemoryConfig
 from ai_memory_mcp.server import create_mcp_server
@@ -95,11 +97,14 @@ def test_event_links_active_turns_and_keeps_trace_after_rotation(tmp_path: Path)
 def test_chat_cards_are_separate_searchable_and_rotate(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
+        started_at = datetime.now(ZoneInfo("Europe/Moscow")).replace(microsecond=0)
+        started_iso = started_at.isoformat(timespec="seconds")
+        rotate_iso = (started_at + timedelta(days=18)).isoformat(timespec="seconds")
         event = store.create_event(
             title="Выбор ноутбука",
             event_type="purchase",
             description="Пользователь выбирает мобильный ноутбук.",
-            start_at="2026-07-02T10:00:00+03:00",
+            start_at=started_iso,
         )
         note = store.append_chat_note(
             "chat_macbook_lenovo",
@@ -107,7 +112,7 @@ def test_chat_cards_are_separate_searchable_and_rotate(tmp_path: Path) -> None:
             title="Продажа Lenovo ради MacBook Neo",
             aliases=["MacBook вместо Lenovo", "Lenovo IdeaPad 3"],
             summary="Выбор MacBook Neo как мобильной macOS-машины.",
-            at="2026-07-02T13:00:00+03:00",
+            at=started_iso,
             event_ids=[event["id"]],
         )
 
@@ -122,10 +127,33 @@ def test_chat_cards_are_separate_searchable_and_rotate(tmp_path: Path) -> None:
         assert "Продажа Lenovo ради MacBook Neo" in context["context_text"]
         assert "Выбор ноутбука" in context["context_text"]
 
-        rotated = store.rotate_chat_memory(at="2026-07-20T00:00:00+03:00")
+        rotated = store.rotate_chat_memory(at=rotate_iso)
         assert rotated["deleted_chat_count"] == 1
         assert store.list_chat_sessions() == []
         assert not any(item.get("chat_id") == "chat_macbook_lenovo" for item in store.search("MacBook Lenovo", limit=10))
+    finally:
+        store.close()
+
+
+def test_historical_chat_import_uses_the_supplied_time(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        event = store.create_event(
+            title="Старый проект",
+            event_type="project",
+            start_at="2020-01-01T09:00:00+03:00",
+        )
+        note = store.append_chat_note(
+            "chat_historical",
+            "Решение из старого чата.",
+            title="Архивный чат",
+            at="2020-01-02T12:00:00+03:00",
+            event_ids=[event["id"]],
+        )
+
+        assert note["chat"]["id"] == "chat_historical"
+        assert note["chat"]["linked_event_ids"] == [event["id"]]
+        assert store.list_chat_sessions() == []
     finally:
         store.close()
 

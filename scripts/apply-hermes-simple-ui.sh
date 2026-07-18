@@ -188,6 +188,78 @@ replace(
 """,
     "",
 )
+replace(
+    sidebar,
+    """        <div className="shrink-0 px-0.5 pb-1 pt-0.5">
+          <ProfileRail />
+        </div>
+""",
+    "",
+)
+
+# Hermes 0.18 moved the built-in sidebar routes into a larger, keybind-aware
+# array and added contribution-backed rows. Normalize the whole section instead
+# of matching one historical formatting variant. This is the cross-platform FPP
+# contract: one New chat row, followed by pins and sessions.
+sidebar_text = sidebar.read_text(encoding="utf-8")
+sidebar_text = sidebar_text.replace("import { useContributions } from '@/contrib/react/use-contributions'\n", "")
+sidebar_text = re.sub(
+    r"import \{\n  type AppView,[\s\S]*?\n\} from '../../routes'",
+    "import { type AppView } from '../../routes'",
+    sidebar_text,
+    count=1,
+)
+sidebar_text = re.sub(
+    r"(?:// FPP_SIDEBAR_NAV:[^\n]*\n)*const SIDEBAR_NAV: SidebarNavItem\[\] = \[[\s\S]*?\n\]\n\n// Two modes",
+    """// FPP_SIDEBAR_NAV: intentionally minimal on Linux and macOS.
+const SIDEBAR_NAV: SidebarNavItem[] = [
+  {
+    id: 'new-session',
+    label: '',
+    icon: props => <Codicon name="robot" {...props} />,
+    action: 'new-session',
+    keybindActionId: 'session.new'
+  }
+]
+
+// Two modes""",
+    sidebar_text,
+    count=1,
+)
+sidebar_text = re.sub(
+    r"  // Contributed nav rows \(plugins pairing a page with a sidebar entry\)[\s\S]*?\n  const panesFlipped =",
+    """  // FPP keeps optional workspace panels in Settings > Hidden Panels.
+  const contributedNav: SidebarNavItem[] = []
+
+  const panesFlipped =""",
+    sidebar_text,
+    count=1,
+)
+sidebar.write_text(sidebar_text, encoding="utf-8")
+
+section_states = desktop / "src/app/chat/sidebar/section-states.tsx"
+section_states_text = section_states.read_text(encoding="utf-8")
+section_states_text = section_states_text.replace("import { Button } from '@/components/ui/button'\n", "")
+section_states_text = re.sub(
+    r"export function SidebarBlankState\([\s\S]*?\n\}\n\nexport function SidebarPinnedEmptyState",
+    """export function SidebarBlankState({ onNewProject: _onNewProject }: { onNewProject: () => void }) {
+  const { t } = useI18n()
+
+  return (
+    <div className="grid min-h-0 flex-1 place-items-center px-4 text-center">
+      <div className="flex flex-col items-center gap-2">
+        <Codicon className="text-(--ui-text-quaternary)" name="comment-discussion" size="1.25rem" />
+        <p className="text-xs text-(--ui-text-tertiary)">{t.sidebar.noSessions}</p>
+      </div>
+    </div>
+  )
+}
+
+export function SidebarPinnedEmptyState""",
+    section_states_text,
+    count=1,
+)
+section_states.write_text(section_states_text, encoding="utf-8")
 
 titlebar = desktop / "src/app/shell/titlebar-controls.tsx"
 text = titlebar.read_text(encoding="utf-8")
@@ -260,10 +332,58 @@ text = text.replace(
 """,
     "",
 )
+text = re.sub(
+    r"\n    \{\n      active: hapticsMuted,\n      icon: <Codicon name=\{hapticsMuted \? 'mute' : 'unmute'\} />,\n      id: 'haptics',\n      label: hapticsMuted \? t\.titlebar\.unmuteHaptics : t\.titlebar\.muteHaptics,\n      onSelect: toggleHaptics\n    \},",
+    "",
+    text,
+)
 text = text.replace("        <TitlebarToolButton navigate={navigate} tool={rightSidebarTool} />\n", "")
+# New Hermes versions keep layout/keybind tools in the array even after the old
+# removal patterns. Filter at the rendering boundary so only the sidebar toggle
+# and settings gear remain visible, exactly like the original Linux FPP UI.
+text = text.replace(
+    "const visibleSystemTools = systemTools.filter(tool => !tool.hidden)",
+    "const visibleSystemTools = systemTools.filter(tool => !tool.hidden && tool.id === 'settings')",
+)
+text = text.replace(
+    ".filter(tool => !tool.hidden)\n          .map(tool => (",
+    ".filter(tool => !tool.hidden && tool.id === 'sidebar')\n          .map(tool => (",
+)
 titlebar.write_text(text, encoding="utf-8")
 
+layout_store = desktop / "src/store/layout.ts"
+layout_store_text = layout_store.read_text(encoding="utf-8")
+if "FPP_FILE_BROWSER_HIDDEN" not in layout_store_text:
+    layout_store_text = layout_store_text.replace(
+        """ensurePaneRegistered(CHAT_SIDEBAR_PANE_ID, { open: true })
+ensurePaneRegistered(FILE_BROWSER_PANE_ID, { open: false })
+ensurePaneRegistered(PREVIEW_PANE_ID, { open: true })""",
+        """ensurePaneRegistered(CHAT_SIDEBAR_PANE_ID, { open: true })
+ensurePaneRegistered(FILE_BROWSER_PANE_ID, { open: false })
+ensurePaneRegistered(PREVIEW_PANE_ID, { open: true })
+
+// FPP_FILE_BROWSER_HIDDEN: migrate existing installations once so the main
+// chat opens cleanly. Afterwards the user's choice in Settings > Hidden Panels
+// is preserved normally across launches.
+const FPP_FILE_BROWSER_HIDDEN_KEY = 'hermes.fpp.fileBrowserHidden.v1'
+
+if (typeof window !== 'undefined') {
+  try {
+    if (window.localStorage.getItem(FPP_FILE_BROWSER_HIDDEN_KEY) !== '1') {
+      setPaneOpen(FILE_BROWSER_PANE_ID, false)
+      window.localStorage.setItem(FPP_FILE_BROWSER_HIDDEN_KEY, '1')
+    }
+  } catch {
+    setPaneOpen(FILE_BROWSER_PANE_ID, false)
+  }
+}""",
+        1,
+    )
+layout_store.write_text(layout_store_text, encoding="utf-8")
+
 app_shell = desktop / "src/app/shell/app-shell.tsx"
+if not app_shell.exists():
+    app_shell = desktop / "src/app/contrib/controller.tsx"
 replace(
     app_shell,
     """  const titlebarToolsWidth =
@@ -282,6 +402,11 @@ replace(
     """        {showStatusbar && !isSecondaryWindow() && (
           <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} />
         )}""",
+)
+replace(
+    app_shell,
+    '          <WiredPane part="statusbar" />',
+    '          {false && <WiredPane part="statusbar" />}',
 )
 
 session_actions = desktop / "src/app/chat/sidebar/session-actions-menu.tsx"
@@ -337,6 +462,20 @@ replace(
 )
 
 session_row_text = session_row.read_text(encoding="utf-8")
+session_row_text = session_row_text.replace(
+    """      title={title}
+      onPin={onPin}
+    >""",
+    """      title={title}
+    >""",
+)
+session_row_text = session_row_text.replace(
+    """              title={title}
+              onPin={onPin}
+            >""",
+    """              title={title}
+            >""",
+)
 if "if (event.shiftKey)" not in session_row_text:
     session_row_text = session_row_text.replace(
         """            onResume()
@@ -353,7 +492,7 @@ if "if (event.shiftKey)" not in session_row_text:
             onResume()
           }}""",
     )
-    session_row.write_text(session_row_text, encoding="utf-8")
+session_row.write_text(session_row_text, encoding="utf-8")
 
 en = desktop / "src/i18n/en.ts"
 replace(en, "      'new-session': 'New session',", "      'new-session': 'New chat',")
@@ -510,6 +649,76 @@ replace(
           ) : activeView === 'fpp' ? (
             <FppSettings onConfigSaved={onConfigSaved} />
           ) : activeView === 'notifications' ? (""",
+)
+
+# Hermes 0.18+ uses data-driven OverlayNav groups instead of OverlayNavItem.
+replace(
+    types,
+    """  | 'gateway'
+  | 'keybinds'""",
+    """  | 'gateway'
+  | 'fpp'
+  | 'hidden-panels'
+  | 'keybinds'""",
+)
+replace(
+    settings_index,
+    """  'providers',
+  'gateway',
+  'keybinds',""",
+    """  'providers',
+  'gateway',
+  'fpp',
+  'hidden-panels',
+  'keybinds',""",
+)
+replace(
+    settings_index,
+    """    {
+      active: activeView === 'gateway',
+      icon: Globe,
+      id: 'gateway',
+      label: t.settings.nav.gateway,
+      onSelect: () => setActiveView('gateway')
+    },
+    {
+      active: activeView === 'keybinds',""",
+    """    {
+      active: activeView === 'gateway',
+      icon: Globe,
+      id: 'gateway',
+      label: t.settings.nav.gateway,
+      onSelect: () => setActiveView('gateway')
+    },
+    {
+      active: activeView === 'fpp',
+      icon: Brain,
+      id: 'fpp',
+      label: 'FPP',
+      onSelect: () => setActiveView('fpp')
+    },
+    {
+      active: activeView === 'hidden-panels',
+      icon: Layers3,
+      id: 'hidden-panels',
+      label: 'Hidden Panels',
+      onSelect: () => setActiveView('hidden-panels')
+    },
+    {
+      active: activeView === 'keybinds',""",
+)
+replace(
+    settings_index,
+    """          ) : activeView === 'gateway' ? (
+            <GatewaySettings />
+          ) : activeView === 'keybinds' ? (""",
+    """          ) : activeView === 'gateway' ? (
+            <GatewaySettings />
+          ) : activeView === 'fpp' ? (
+            <FppSettings onConfigSaved={onConfigSaved} />
+          ) : activeView === 'hidden-panels' ? (
+            <HiddenPanelsSettings />
+          ) : activeView === 'keybinds' ? (""",
 )
 
 fpp_settings = desktop / "src/app/settings/fpp-settings.tsx"
@@ -869,6 +1078,8 @@ if "session_key?: string" not in types_hermes_text:
 types_hermes.write_text(types_hermes_text, encoding="utf-8")
 
 desktop_controller = desktop / "src/app/desktop-controller.tsx"
+if not desktop_controller.exists():
+    desktop_controller = desktop / "src/app/session/hooks/use-session-list-actions.ts"
 desktop_controller_text = desktop_controller.read_text(encoding="utf-8")
 if "filterTemporarySessions" not in desktop_controller_text:
     desktop_controller_text = desktop_controller_text.replace(
@@ -877,6 +1088,12 @@ if "filterTemporarySessions" not in desktop_controller_text:
         """  CRON_SECTION_LIMIT,
   filterTemporarySessions,
   getRecentlySettledSessionIds,""",
+        1,
+    )
+if "filterTemporarySessions" not in desktop_controller_text:
+    desktop_controller_text = desktop_controller_text.replace(
+        "  CRON_SECTION_LIMIT,\n",
+        "  CRON_SECTION_LIMIT,\n  filterTemporarySessions,\n",
         1,
     )
 desktop_controller_text = desktop_controller_text.replace(
@@ -912,22 +1129,24 @@ if "temporaryChatActive," not in context_menu_text:
   onStartTemporaryChat,
   temporaryChatActive,""",
     )
-if "Temporary chat active" not in context_menu_text:
-    context_menu_text = context_menu_text.replace(
-        """          <ContextMenuItem icon={MessageSquareText} onSelect={() => setSnippetsOpen(true)}>
-            {c.promptSnippets}
-          </ContextMenuItem>
+# Remove any partial/duplicate insertion from older FPP patchers, then place the
+# toggle directly after Prompt snippets. They intentionally share one menu
+# group, matching the original compact Hermes UI.
+context_menu_text = re.sub(
+    r"\n\s*(?:<DropdownMenuSeparator />\n\s*)?<ContextMenuItem icon=\{Clock\} onSelect=\{onStartTemporaryChat\}>[\s\S]*?</ContextMenuItem>",
+    "",
+    context_menu_text,
+)
+context_menu_text = re.sub(
+    r"(\s*<ContextMenuItem icon=\{MessageSquareText\} onSelect=\{\(\) => setSnippetsOpen\(true\)\}>\n\s*\{c\.promptSnippets\}\n\s*</ContextMenuItem>)",
+    r"""\1
 
-          <DropdownMenuSeparator />""",
-        """          <ContextMenuItem icon={MessageSquareText} onSelect={() => setSnippetsOpen(true)}>
-            {c.promptSnippets}
-          </ContextMenuItem>
           <ContextMenuItem icon={Clock} onSelect={onStartTemporaryChat}>
             {temporaryChatActive ? 'Temporary chat active' : 'Temporary chat'}
-          </ContextMenuItem>
-
-          <DropdownMenuSeparator />""",
-    )
+          </ContextMenuItem>""",
+    context_menu_text,
+    count=1,
+)
 if "temporaryChatActive?: boolean" not in context_menu_text:
     context_menu_text = context_menu_text.replace(
         """  onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void
@@ -944,6 +1163,10 @@ composer_index_text = composer_index.read_text(encoding="utf-8")
 composer_index_text = composer_index_text.replace(
     "import { $gatewayState, $messages, setSessionPickerOpen } from '@/store/session'",
     "import { $gatewayState, $messages, $temporaryChatMode, setSessionPickerOpen, setTemporaryChatMode } from '@/store/session'",
+)
+composer_index_text = composer_index_text.replace(
+    "import { $gatewayState } from '@/store/session'",
+    "import { $gatewayState, $temporaryChatMode, setTemporaryChatMode } from '@/store/session'",
 )
 composer_index_lines = [
     line
@@ -966,6 +1189,12 @@ if "const temporaryChatMode = useStore($temporaryChatMode)" not in composer_inde
         "  const aui = useAui()\n  const draft = useAuiState(s => s.composer.text)",
         "  const aui = useAui()\n  const draft = useAuiState(s => s.composer.text)\n  const temporaryChatMode = useStore($temporaryChatMode)",
     )
+if "const temporaryChatMode = useStore($temporaryChatMode)" not in composer_index_text:
+    composer_index_text = composer_index_text.replace(
+        "  const { t } = useI18n()\n",
+        "  const { t } = useI18n()\n  const temporaryChatMode = useStore($temporaryChatMode)\n",
+        1,
+    )
 if "onStartTemporaryChat={() =>" not in composer_index_text:
     composer_index_text = composer_index_text.replace(
         """      onPasteClipboardImage={onPasteClipboardImage}
@@ -977,6 +1206,14 @@ if "onStartTemporaryChat={() =>" not in composer_index_text:
       temporaryChatActive={temporaryChatMode}
       onPickFiles={onPickFiles}""",
     )
+composer_index_text = composer_index_text.replace(
+    """      onStartTemporaryChat={() => {
+        setTemporaryChatMode(true)
+      }}""",
+    """      onStartTemporaryChat={() => {
+        setTemporaryChatMode(!temporaryChatMode)
+      }}""",
+)
 composer_index_text = re.sub(
     r"\n    // Backspace right after a temporary-chat chip: if the input is empty,[\s\S]*?\n    // Plain Backspace right after a directive chip:",
     "\n    // Plain Backspace right after a directive chip:",
@@ -1021,6 +1258,8 @@ composer_index_text = re.sub(
 composer_index.write_text(composer_index_text, encoding="utf-8")
 
 session_actions_hook = desktop / "src/app/session/hooks/use-session-actions.ts"
+if not session_actions_hook.exists():
+    session_actions_hook = desktop / "src/app/session/hooks/use-session-actions/index.ts"
 session_actions_text = session_actions_hook.read_text(encoding="utf-8")
 if "$temporaryChatMode" not in session_actions_text:
     session_actions_text = session_actions_text.replace(
@@ -1133,6 +1372,70 @@ if "async (storedSessionId: string, replaceRoute = false) => {\n      const clos
       setTemporaryChatMode(false)
       const requestId = resumeRequestRef.current + 1""",
     )
+
+# Hermes 0.18+ moved this hook into an index module and centralized the
+# session.create payload in desktopSessionCreateParams().
+if "  $temporaryChatMode,\n" not in session_actions_text:
+    session_actions_text = session_actions_text.replace(
+        "  $messages,\n",
+        "  $messages,\n  $temporaryChatMode,\n",
+        1,
+    )
+if "clearTemporarySession," not in session_actions_text:
+    session_actions_text = session_actions_text.replace(
+        "  sessionPinId,\n",
+        "  clearTemporarySession,\n  isTemporarySession,\n  markTemporarySession,\n  sessionPinId,\n",
+        1,
+    )
+if "setTemporaryChatMode," not in session_actions_text:
+    session_actions_text = session_actions_text.replace(
+        "  setTurnStartedAt,\n",
+        "  setTemporaryChatMode,\n  setTurnStartedAt,\n",
+        1,
+    )
+if "...(temporaryChat ? { disable_mcp: true, ephemeral: true } : {})" not in session_actions_text:
+    session_actions_text = session_actions_text.replace(
+        "    ...($currentFastMode.get() ? { fast: true } : {})\n",
+        "    ...($currentFastMode.get() ? { fast: true } : {}),\n"
+        "    ...($temporaryChatMode.get() ? { disable_mcp: true, ephemeral: true } : {})\n",
+        1,
+    )
+if "const closingTemporaryRuntimeId = activeSessionIdRef.current\n      if (closingTemporaryRuntimeId" not in session_actions_text:
+    session_actions_text = session_actions_text.replace(
+        """      const workspaceTarget = hasWorkspaceTarget
+        ? normalizeNewChatWorkspaceTarget(draftOptions.workspaceTarget)
+        : undefined
+
+      resetViewSync()""",
+        """      const workspaceTarget = hasWorkspaceTarget
+        ? normalizeNewChatWorkspaceTarget(draftOptions.workspaceTarget)
+        : undefined
+
+      const closingTemporaryRuntimeId = activeSessionIdRef.current
+      if (closingTemporaryRuntimeId && isTemporarySession(closingTemporaryRuntimeId)) {
+        void requestGateway('session.close', { session_id: closingTemporaryRuntimeId })
+          .catch(() => undefined)
+          .finally(() => clearTemporarySession(closingTemporaryRuntimeId))
+      }
+      setTemporaryChatMode(false)
+      resetViewSync()""",
+        1,
+    )
+session_actions_text = session_actions_text.replace(
+    """    [activeSessionIdRef, busyRef, navigate, onFreshDraftRouteIntent, resetViewSync, selectedStoredSessionIdRef]
+  )""",
+    """    [
+      activeSessionIdRef,
+      busyRef,
+      navigate,
+      onFreshDraftRouteIntent,
+      requestGateway,
+      resetViewSync,
+      selectedStoredSessionIdRef
+    ]
+  )""",
+    1,
+)
 session_actions_hook.write_text(session_actions_text, encoding="utf-8")
 
 acp_session = hermes_root / "acp_adapter/session.py"
@@ -1560,17 +1863,32 @@ tui_server_text = tui_server_text.replace(
     'if "hermes-memory" not in str(name).lower() and "hermes_memory" not in str(name).lower()',
     'if "hermes-memory" not in str(name).lower()\n        and "hermes_memory" not in str(name).lower()\n        and str(name).lower() != "session_search"',
 )
-if "disable_memory_mcp: bool = False,\n    ephemeral_session: bool = False," not in tui_server_text:
-    tui_server_text = tui_server_text.replace(
-        """    reasoning_config_override: dict | None = None,
-    service_tier_override: str | None = None,
-):""",
-        """    reasoning_config_override: dict | None = None,
-    service_tier_override: str | None = None,
-    disable_memory_mcp: bool = False,
-    ephemeral_session: bool = False,
-):""",
-        1,
+# FPP_TUI_PRIVACY_SIGNATURE: keep the lazy Desktop/TUI agent factory aligned
+# with the privacy flags passed by session.new. Match the whole signature so
+# upstream parameters added between releases do not make this silently fail.
+tui_make_agent_signature = re.search(
+    r"def _make_agent\(\n(?P<params>(?:    [^\n]*\n)+?)\):",
+    tui_server_text,
+)
+if tui_make_agent_signature is None:
+    raise SystemExit("FPP patch validation failed: tui_gateway._make_agent signature not found")
+privacy_parameter_lines = (
+    "disable_memory_mcp: bool = False",
+    "ephemeral_session: bool = False",
+)
+existing_privacy_params = {
+    line.strip().rstrip(",") for line in tui_make_agent_signature.group("params").splitlines()
+}
+missing_privacy_params = [line for line in privacy_parameter_lines if line not in existing_privacy_params]
+if missing_privacy_params:
+    updated_signature = tui_make_agent_signature.group(0).replace(
+        "\n):",
+        "\n" + "\n".join(f"    {line}," for line in missing_privacy_params) + "\n):",
+    )
+    tui_server_text = (
+        tui_server_text[: tui_make_agent_signature.start()]
+        + updated_signature
+        + tui_server_text[tui_make_agent_signature.end() :]
     )
 if "enabled_toolsets = _load_enabled_toolsets()\n    if disable_memory_mcp or ephemeral_session:" not in tui_server_text:
     tui_server_text = tui_server_text.replace(
@@ -1663,6 +1981,19 @@ if "enabled_override=_filter_hermes_memory_toolsets(_load_enabled_toolsets())" n
                 )""",
         1,
     )
+
+# Validate the exact factory contract after all rewrites. Merely finding the
+# flag names elsewhere in this large module is not sufficient: that allowed a
+# broken build where callers passed the flags but _make_agent rejected them.
+tui_make_agent_signature = re.search(
+    r"def _make_agent\(\n(?P<params>(?:    [^\n]*\n)+?)\):",
+    tui_server_text,
+)
+if tui_make_agent_signature is None or not {
+    "disable_memory_mcp: bool = False",
+    "ephemeral_session: bool = False",
+}.issubset(set(line.strip().rstrip(",") for line in tui_make_agent_signature.group("params").splitlines())):
+    raise SystemExit("FPP patch validation failed: tui_gateway._make_agent privacy flags are missing")
 if "if session.get(\"ephemeral\"):\n        return\n    # Persist into the session's own profile db" not in tui_server_text:
     tui_server_text = tui_server_text.replace(
         """    if not key:
@@ -1761,6 +2092,60 @@ tui_server_text = tui_server_text.replace(
     1,
 )
 tui_server.write_text(tui_server_text, encoding="utf-8")
+
+tui_privacy_test = hermes_root / "tests/tui_gateway/test_fpp_temporary_chat.py"
+tui_privacy_test.parent.mkdir(parents=True, exist_ok=True)
+tui_privacy_test.write_text(
+    '''"""FPP regression coverage for Temporary chat agent construction."""
+
+from unittest.mock import MagicMock, patch
+
+
+def test_temporary_agent_factory_accepts_privacy_flags_and_disables_persistence():
+    fake_runtime = {
+        "provider": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "api_key": "test-key",
+        "api_mode": "anthropic_messages",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    fake_cfg = {
+        "model": {"default": "test-model", "provider": "anthropic"},
+        "agent": {"system_prompt": ""},
+    }
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value=fake_cfg),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch(
+            "tui_gateway.server._load_enabled_toolsets",
+            return_value=["hermes-memory", "session_search", "web"],
+        ),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway.server import _make_agent
+
+        _make_agent(
+            "temporary-runtime",
+            "temporary-session",
+            disable_memory_mcp=True,
+            ephemeral_session=True,
+        )
+
+    kwargs = mock_agent.call_args.kwargs
+    assert kwargs["enabled_toolsets"] == ["web"]
+    assert kwargs["session_db"] is False
+''',
+    encoding="utf-8",
+)
 
 tts_tool = hermes_root / "tools/tts_tool.py"
 if tts_tool.exists():
@@ -1906,6 +2291,8 @@ if hermes_api.exists():
     hermes_api.write_text(hermes_api_text, encoding="utf-8")
 
 electron_main = desktop / "electron/main.cjs"
+if not electron_main.exists():
+    electron_main = desktop / "electron/main.ts"
 if electron_main.exists():
     electron_main_text = electron_main.read_text(encoding="utf-8")
     timeout_helpers = r'''
@@ -1972,7 +2359,8 @@ function defaultTimeoutMsForHermesApiRequest(request) {
     electron_main.write_text(electron_main_text, encoding="utf-8")
 
 hidden_panels = desktop / "src/app/settings/hidden-panels-settings.tsx"
-hidden_panels.write_text(r'''import { useNavigate } from 'react-router-dom'
+hidden_panels.write_text(r'''import { useStore } from '@nanostores/react'
+import { useNavigate } from 'react-router-dom'
 
 import { Button } from '@/components/ui/button'
 import {
@@ -1984,7 +2372,8 @@ import {
   PROFILES_ROUTE,
   SKILLS_ROUTE
 } from '@/app/routes'
-import { Archive, ArrowUpRight, Clock, Command, Globe, Layers3, MessageCircle, Users, Wrench, Zap } from '@/lib/icons'
+import { Archive, ArrowUpRight, Clock, Command, FolderOpen, Globe, Layers3, MessageCircle, Users, Wrench, Zap } from '@/lib/icons'
+import { $fileBrowserOpen, setFileBrowserOpen } from '@/store/layout'
 
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
 
@@ -2085,6 +2474,27 @@ function PanelGroup({ panels }: { panels: HiddenPanel[] }) {
   )
 }
 
+function FileBrowserPanelRow() {
+  const open = useStore($fileBrowserOpen)
+
+  return (
+    <ListRow
+      action={
+        <Button onClick={() => setFileBrowserOpen(!open)} size="sm" type="button" variant="outline">
+          {open ? 'Hide' : 'Show'}
+        </Button>
+      }
+      description="Browse workspace files when needed without keeping the panel in the main chat."
+      title={
+        <span className="inline-flex min-w-0 items-center gap-2">
+          <FolderOpen className="size-4 shrink-0 text-muted-foreground" />
+          <span className="truncate">File browser</span>
+        </span>
+      }
+    />
+  )
+}
+
 export function HiddenPanelsSettings() {
   return (
     <SettingsContent>
@@ -2097,7 +2507,12 @@ export function HiddenPanelsSettings() {
         <div className="mb-1.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
           Workspace
         </div>
-        <PanelGroup panels={WORKSPACE_PANELS} />
+        <div className="divide-y divide-(--ui-stroke-tertiary)">
+          <FileBrowserPanelRow />
+          {WORKSPACE_PANELS.map(panel => (
+            <PanelRow key={panel.title} panel={panel} />
+          ))}
+        </div>
       </div>
 
       <div className="mt-5">
@@ -2202,22 +2617,57 @@ while "  const showStatusbar = false\n  const showStatusbar = false\n" in app_sh
         "  const showStatusbar = false\n  const showStatusbar = false\n",
         "  const showStatusbar = false\n",
     )
+app_shell_text = app_shell_text.replace("  const SYSTEM_TOOL_COUNT = 4", "  const SYSTEM_TOOL_COUNT = 1")
+app_shell_text = app_shell_text.replace(
+    '<Slot area="titleBar.right" />',
+    '{false && <Slot area="titleBar.right" />}',
+)
+app_shell_text = app_shell_text.replace(
+    '{false && {false && <Slot area="titleBar.right" />}}',
+    '{false && <Slot area="titleBar.right" />}',
+)
 app_shell.write_text(app_shell_text, encoding="utf-8")
+
+wiring = desktop / "src/app/contrib/wiring.tsx"
+if wiring.exists():
+    wiring_text = wiring.read_text(encoding="utf-8")
+    wiring_text = wiring_text.replace("  const SYSTEM_TOOL_COUNT = 4", "  const SYSTEM_TOOL_COUNT = 1")
+    wiring.write_text(wiring_text, encoding="utf-8")
+
+theme_context = desktop / "src/themes/context.tsx"
+theme_context_text = theme_context.read_text(encoding="utf-8")
+theme_context_text = theme_context_text.replace("const RETIRED_SKINS = new Set(['nous-light', 'default', 'gold'])\n", "")
+theme_context_text = re.sub(
+    r"const normalizeSkin = \(name: string \| null\): string =>\n\s*name && resolveTheme\(name\) && !RETIRED_SKINS\.has\(name\) \? name : DEFAULT_SKIN_NAME",
+    """// FPP_THEME_DEFAULT: the original Linux FPP appearance on every OS.
+const normalizeSkin = (_name: string | null): string => 'mono'""",
+    theme_context_text,
+    count=1,
+)
+theme_context_text = re.sub(
+    r"const normalizeMode = \(value: string \| null\): ThemeMode =>\n\s*value === 'light' \|\| value === 'dark' \|\| value === 'system' \? value : 'light'",
+    "const normalizeMode = (_value: string | null): ThemeMode => 'dark'",
+    theme_context_text,
+    count=1,
+)
+theme_context.write_text(theme_context_text, encoding="utf-8")
 
 native_notifications = desktop / "src/store/native-notifications.ts"
 if native_notifications.exists():
     native_notifications_text = native_notifications.read_text(encoding="utf-8")
+    # Keep native OS notifications on both Linux and macOS. Older FPP builds
+    # disabled them globally; restore the upstream implementation when updating.
     native_notifications_text = native_notifications_text.replace(
-        "const DEFAULT_PREFS: NativeNotificationPrefs = {\n  enabled: true,",
         "const DEFAULT_PREFS: NativeNotificationPrefs = {\n  enabled: false,",
-    )
-    native_notifications_text = native_notifications_text.replace(
-        "export function dispatchNativeNotification(input: NativeNotificationInput): void {\n  const prefs = $nativeNotifyPrefs.get()",
-        "export function dispatchNativeNotification(input: NativeNotificationInput): void {\n  void input\n  return\n\n  const prefs = $nativeNotifyPrefs.get()",
+        "const DEFAULT_PREFS: NativeNotificationPrefs = {\n  enabled: true,",
     )
     native_notifications_text = native_notifications_text.replace(
         "export function dispatchNativeNotification(input: NativeNotificationInput): void {\n  void input\n  return\n\n  void input\n  return\n\n  const prefs = $nativeNotifyPrefs.get()",
+        "export function dispatchNativeNotification(input: NativeNotificationInput): void {\n  const prefs = $nativeNotifyPrefs.get()",
+    )
+    native_notifications_text = native_notifications_text.replace(
         "export function dispatchNativeNotification(input: NativeNotificationInput): void {\n  void input\n  return\n\n  const prefs = $nativeNotifyPrefs.get()",
+        "export function dispatchNativeNotification(input: NativeNotificationInput): void {\n  const prefs = $nativeNotifyPrefs.get()",
     )
     native_notifications.write_text(native_notifications_text, encoding="utf-8")
 
@@ -2304,6 +2754,39 @@ styles_text = re.sub(
     flags=re.DOTALL,
 )
 styles.write_text(styles_text.rstrip() + "\n" + readability_css.strip() + "\n", encoding="utf-8")
+
+# Fail loudly when an upstream Hermes update makes an essential replacement no
+# longer applicable. The previous patcher could print success after applying
+# only part of FPP, producing a build with subtly broken memory/privacy rules.
+required_markers = [
+    (fpp_settings, "export function FppSettings"),
+    (hidden_panels, "export function HiddenPanelsSettings"),
+    (hidden_panels, "<FileBrowserPanelRow />"),
+    (settings_index, "<FppSettings"),
+    (sidebar, "FPP_SIDEBAR_NAV"),
+    (titlebar, "tool.id === 'settings'"),
+    (store_session, "$temporaryChatMode"),
+    (context_menu, "Temporary chat active"),
+    (composer_index, 'data-slot="temporary-chat-chip"'),
+    (theme_context, "FPP_THEME_DEFAULT"),
+    (layout_store, "FPP_FILE_BROWSER_HIDDEN"),
+    (session_actions_hook, "ephemeral: true"),
+    (acp_session, "ephemeral"),
+    (acp_server, "_disable_hermes_memory_tools"),
+    (tui_privacy_test, "test_temporary_agent_factory_accepts_privacy_flags"),
+    (styles, "FPP readable UI scale"),
+]
+for backend_path in (api_server, tui_server):
+    if backend_path.exists():
+        required_markers.append((backend_path, "disable_memory_mcp"))
+
+missing_markers = []
+for required_path, marker in required_markers:
+    if not required_path.exists() or marker not in required_path.read_text(encoding="utf-8"):
+        missing_markers.append(f"{required_path}: {marker}")
+if missing_markers:
+    details = "\n  - ".join(missing_markers)
+    raise SystemExit(f"FPP patch validation failed; upstream Hermes is incompatible:\n  - {details}")
 
 print("Hermes Desktop simple UI patch applied.")
 PY
