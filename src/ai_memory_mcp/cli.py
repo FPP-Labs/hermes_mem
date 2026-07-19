@@ -170,6 +170,14 @@ def build_parser() -> argparse.ArgumentParser:
     forget.add_argument("memory_id")
 
     sub.add_parser("day-stats", help="Show rolling day stats")
+
+    dashboard = sub.add_parser("dashboard", help="Show data for the Hermes Mem settings dashboard")
+    dashboard.add_argument("--query", default="")
+    dashboard.add_argument("--scope", choices=["all", "long-term", "10-day", "events"], default="all")
+    dashboard.add_argument("--limit", type=int, default=40)
+
+    clear_all = sub.add_parser("clear-all", help="Delete every Hermes Mem memory record")
+    clear_all.add_argument("--confirm", required=True)
     return parser
 
 
@@ -327,6 +335,10 @@ def main(argv: list[str] | None = None) -> int:
             _print(store.forget_memory(args.memory_id))
         elif args.command == "day-stats":
             _print(store.day_stats())
+        elif args.command == "dashboard":
+            _print(store.memory_dashboard(query=args.query, scope=args.scope, limit=args.limit))
+        elif args.command == "clear-all":
+            _print(store.clear_all_memory(confirmation=args.confirm))
         else:
             parser.error(f"unknown command: {args.command}")
     finally:

@@ -302,4 +302,4 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
 
 def run_server(config: MemoryConfig | None = None, *, transport: str = "stdio") -> None:
     server = create_mcp_server(config)
-    server.run(transport=transport)  # type: ignore[arg-type]
+    server.run(transport=transport)

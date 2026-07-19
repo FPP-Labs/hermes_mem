@@ -414,7 +414,7 @@ class MemoryStore:
     def _format_turn_memory(self, created_at: str, user_message: str, assistant_message: str) -> str:
         parts = [f"[{created_at}]"]
         if user_message.strip():
-            parts.append(f"Пользователь: {user_message.strip()}")
+            parts.append(f"User: {user_message.strip()}")
         if assistant_message.strip():
             parts.append(f"Hermes: {assistant_message.strip()}")
         return "\n".join(parts)
@@ -900,16 +900,16 @@ class MemoryStore:
         if session:
             title = session.get("title") or session["id"]
             aliases = ", ".join(session.get("aliases") or [])
-            parts.append(f"Чат: {title}")
+            parts.append(f"Chat: {title}")
             if aliases:
-                parts.append(f"Алиасы: {aliases}")
+                parts.append(f"Aliases: {aliases}")
             if session.get("summary"):
-                parts.append(f"Сводка: {session['summary']}")
+                parts.append(f"Summary: {session['summary']}")
         if events:
-            parts.append("Связанные события:\n" + "\n".join(f"- {self._format_event(event)}" for event in events))
+            parts.append("Linked events:\n" + "\n".join(f"- {self._format_event(event)}" for event in events))
         if notes:
             parts.append(
-                "Заметки чата:\n"
+                "Chat notes:\n"
                 + "\n".join(f"- [{note.get('day') or note.get('created_at')}] {note['text']}" for note in notes)
             )
         context_text, truncated = self._fit_text("\n\n".join(parts), limit_chars)
@@ -995,11 +995,11 @@ class MemoryStore:
             traces = [trace for trace in traces if query.lower() in trace["text"].lower()]
         text_parts = [self._format_event(event)]
         if memories:
-            text_parts.append("Связанные подробные воспоминания события:")
+            text_parts.append("Linked detailed event memories:")
             for memory in memories:
                 text_parts.append(f"- {memory['day']}: {memory['text']}")
         if traces:
-            text_parts.append("Короткие следы удаленной подробной памяти события:")
+            text_parts.append("Short traces of removed detailed event memory:")
             for trace in traces:
                 text_parts.append(f"- {trace['day']}: {trace['text']}")
         context_text, truncated = self._fit_text("\n".join(text_parts), limit_chars)
@@ -1197,18 +1197,18 @@ class MemoryStore:
         detailed = self.get_10_day_detailed_memory(today=parse_day(current_at, self.zone), max_chars=detailed_budget)
         search_results = self.search(query, limit=self.config.max_search_items) if query and include_search else []
 
-        sections = [f"Сегодня: {today['human']} ({today['timezone']})."]
+        sections = [f"Current local time: {today['human']} ({today['timezone']})."]
         if facts:
-            sections.append("Вечные факты о пользователе:\n" + "\n".join(f"- {fact['fact']}" for fact in facts))
+            sections.append("Permanent user facts:\n" + "\n".join(f"- {fact['fact']}" for fact in facts))
         if active_events:
-            sections.append("Активные события:\n" + "\n".join(f"- {self._format_event(event)}" for event in active_events))
+            sections.append("Active events:\n" + "\n".join(f"- {self._format_event(event)}" for event in active_events))
         if query and search_results:
             sections.append(
-                "Релевантные найденные воспоминания:\n"
+                "Relevant memory search results:\n"
                 + "\n".join(f"- [{item['type']}] {item['text']}" for item in search_results)
             )
         if include_detailed_memory and detailed["context_text"]:
-            sections.append("Подробная 10-дневная память:\n" + detailed["context_text"])
+            sections.append("Detailed 10-day memory:\n" + detailed["context_text"])
         context_text, truncated = self._fit_text("\n\n".join(sections), limit_chars)
         return {
             "today": today,
@@ -1249,6 +1249,85 @@ class MemoryStore:
         results.extend(self._search_events(fts, max_items))
         results.extend(self._search_event_traces(fts, max_items))
         return results[:max_items]
+
+    def memory_dashboard(
+        self,
+        *,
+        query: str = "",
+        scope: str = "all",
+        limit: int = 40,
+    ) -> dict[str, Any]:
+        normalized_scope = scope.strip().lower().replace("_", "-")
+        if normalized_scope not in {"all", "long-term", "10-day", "events"}:
+            raise ValueError("scope must be all, long-term, 10-day, or events")
+        safe_limit = max(1, min(int(limit), 100))
+        today = self.get_today()
+        detailed = self.get_10_day_detailed_memory(today=today["date"], max_chars=200_000)
+        today_memory = next((day for day in detailed["days"] if day["day"] == today["date"]), None)
+        results = self.search(query, limit=100) if query.strip() else []
+        long_term_types = {"forever_fact"}
+        ten_day_types = {"day_chunk", "chat_session", "chat_note"}
+        event_types = {"event", "event_trace"}
+        if normalized_scope == "long-term":
+            results = [item for item in results if item.get("type") in long_term_types]
+        elif normalized_scope == "10-day":
+            results = [item for item in results if item.get("type") in ten_day_types]
+        elif normalized_scope == "events":
+            results = [item for item in results if item.get("type") in event_types]
+        return {
+            "today": today,
+            "today_memory": today_memory or {"day": today["date"], "chunks": [], "chars": 0},
+            "ten_day_memory": detailed["days"],
+            "forever_facts": self.list_forever_facts(limit=100),
+            "active_events": self.active_events(at=today["now"]),
+            "search": {
+                "query": query,
+                "scope": normalized_scope,
+                "results": results[:safe_limit],
+            },
+            "health": self.doctor(),
+        }
+
+    def clear_all_memory(self, *, confirmation: str) -> dict[str, Any]:
+        if confirmation != "DELETE_ALL_MEMORY":
+            raise ValueError("confirmation must be DELETE_ALL_MEMORY")
+        counts = self.doctor()
+        self.conn.execute("PRAGMA secure_delete = ON")
+        for table in (
+            "event_memory_links",
+            "event_traces_fts",
+            "event_traces",
+            "chat_event_links",
+            "chat_notes_fts",
+            "chat_notes",
+            "chat_sessions_fts",
+            "chat_sessions",
+            "day_chunks_fts",
+            "day_chunks",
+            "turns",
+            "days",
+            "forever_facts_fts",
+            "forever_facts",
+            "events_fts",
+            "events",
+            "operations",
+        ):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+        return {
+            "deleted": True,
+            "previous_counts": {
+                key: counts[key]
+                for key in (
+                    "active_chunks",
+                    "forever_facts",
+                    "events",
+                    "event_traces",
+                    "chat_sessions",
+                    "chat_notes",
+                )
+            },
+        }
 
     def _search_day_chunks(self, fts_query: str, limit: int) -> list[dict[str, Any]]:
         try:

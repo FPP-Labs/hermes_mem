@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-memory-mcp"
-version = "0.1.0"
-description = "Local SQLite memory MCP server for Hermes"
-readme = "README.md"
+version = "0.1.0b1"
+description = "Hermes Mem is an independent community fork of Hermes Agent focused on isolated local memory and a simplified desktop experience"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "ai-memory-mcp maintainers" }]
+authors = [{ name = "FPP Labs" }]
 dependencies = [
   "mcp>=1.27,<2",
 ]
@@ -21,6 +20,11 @@ dev = [
 
 [project.scripts]
 ai-memory-mcp = "ai_memory_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/FPP-Labs/hermes_mem"
+Source = "https://github.com/FPP-Labs/hermes_mem"
+"Hermes Agent by Nous Research" = "https://github.com/NousResearch/hermes-agent"
 
 [tool.setuptools.packages.find]
 where = ["src"]

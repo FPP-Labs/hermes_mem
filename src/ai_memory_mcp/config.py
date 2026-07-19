@@ -65,7 +65,7 @@ def _read_toml(path: Path) -> dict[str, object]:
 @dataclass(frozen=True)
 class MemoryConfig:
     db_path: Path
-    timezone: str = "Europe/Moscow"
+    timezone: str = "UTC"
     detailed_retention_days: int = 10
     chat_retention_days: int = 10
     gradual_delete_chars: int = 20_000
@@ -82,7 +82,7 @@ class MemoryConfig:
             raw.get("timezone")
             or os.environ.get("HERMES_MEMORY_TIMEZONE")
             or os.environ.get("TZ")
-            or "Europe/Moscow"
+            or "UTC"
         )
         return cls(
             db_path=db_path,
@@ -111,7 +111,7 @@ def write_default_config(path: Path | None = None, *, overwrite: bool = False) -
         "\n".join(
             [
                 f'db_path = "{default_db_path()}"',
-                'timezone = "Europe/Moscow"',
+                'timezone = "UTC"',
                 "detailed_retention_days = 10",
                 "chat_retention_days = 10",
                 "gradual_delete_chars = 20000",

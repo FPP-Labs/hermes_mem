@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-HERMES_ROOT="${HERMES_ROOT:-"$HOME/.hermes/hermes-agent"}"
+HERMES_ROOT="${HERMES_ROOT:-"$HOME/.hermes-mem/hermes/hermes-agent"}"
 DESKTOP_DIR="$HERMES_ROOT/apps/desktop"
 DO_PACK=0
 
@@ -45,11 +45,61 @@ done
 
 python3 - "$DESKTOP_DIR" <<'PY'
 from pathlib import Path
+import json
 import re
 import sys
 
 desktop = Path(sys.argv[1])
 hermes_root = desktop.parent.parent
+
+package_json = desktop / "package.json"
+package_data = json.loads(package_json.read_text(encoding="utf-8"))
+package_data["version"] = "0.1.0-beta.1"
+package_data["productName"] = "Hermes Mem"
+package_data["description"] = "Independent community edition based on Hermes Agent by Nous Research."
+build = package_data.setdefault("build", {})
+build["appId"] = "app.hermesmem.desktop"
+build["productName"] = "Hermes Mem"
+build["artifactName"] = "Hermes-Mem-Beta-0.1-${os}-${arch}.${ext}"
+build["protocols"] = [{"name": "Hermes Mem Protocol", "schemes": ["hermes-mem"]}]
+mac = build.setdefault("mac", {})
+extend_info = mac.setdefault("extendInfo", {})
+extend_info["CFBundleDisplayName"] = "Hermes Mem"
+extend_info["CFBundleName"] = "Hermes Mem"
+package_json.write_text(json.dumps(package_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+legacy_settings = desktop / "src/app/settings/fpp-settings.tsx"
+mem_settings_path = desktop / "src/app/settings/mem-settings.tsx"
+if legacy_settings.exists():
+    migrated_text = legacy_settings.read_text(encoding="utf-8")
+    migrated_text = migrated_text.replace("FPP", "MEM").replace("Fpp", "Mem").replace("fpp", "mem")
+    mem_settings_path.write_text(migrated_text, encoding="utf-8")
+    legacy_settings.unlink()
+
+legacy_privacy_test = hermes_root / "tests/tui_gateway/test_fpp_temporary_chat.py"
+mem_privacy_test = hermes_root / "tests/tui_gateway/test_mem_temporary_chat.py"
+if legacy_privacy_test.exists():
+    migrated_text = legacy_privacy_test.read_text(encoding="utf-8")
+    migrated_text = migrated_text.replace("FPP", "MEM").replace("Fpp", "Mem").replace("fpp", "mem")
+    mem_privacy_test.parent.mkdir(parents=True, exist_ok=True)
+    mem_privacy_test.write_text(migrated_text, encoding="utf-8")
+    legacy_privacy_test.unlink()
+
+for legacy_path in (
+    desktop / "src/app/chat/sidebar/sidebar.tsx",
+    desktop / "src/store/layout.ts",
+    desktop / "src/app/settings/types.ts",
+    desktop / "src/app/settings/index.tsx",
+    desktop / "src/themes/context.tsx",
+    desktop / "src/styles.css",
+):
+    if not legacy_path.exists():
+        continue
+    migrated_text = legacy_path.read_text(encoding="utf-8")
+    if "FPP" not in migrated_text and "Fpp" not in migrated_text and "fpp" not in migrated_text:
+        continue
+    migrated_text = migrated_text.replace("FPP", "MEM").replace("Fpp", "Mem").replace("fpp", "mem")
+    legacy_path.write_text(migrated_text, encoding="utf-8")
 
 def replace(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
@@ -197,10 +247,6 @@ replace(
     "",
 )
 
-# Hermes 0.18 moved the built-in sidebar routes into a larger, keybind-aware
-# array and added contribution-backed rows. Normalize the whole section instead
-# of matching one historical formatting variant. This is the cross-platform FPP
-# contract: one New chat row, followed by pins and sessions.
 sidebar_text = sidebar.read_text(encoding="utf-8")
 sidebar_text = sidebar_text.replace("import { useContributions } from '@/contrib/react/use-contributions'\n", "")
 sidebar_text = re.sub(
@@ -210,8 +256,8 @@ sidebar_text = re.sub(
     count=1,
 )
 sidebar_text = re.sub(
-    r"(?:// FPP_SIDEBAR_NAV:[^\n]*\n)*const SIDEBAR_NAV: SidebarNavItem\[\] = \[[\s\S]*?\n\]\n\n// Two modes",
-    """// FPP_SIDEBAR_NAV: intentionally minimal on Linux and macOS.
+    r"(?:// MEM_SIDEBAR_NAV:[^\n]*\n)*const SIDEBAR_NAV: SidebarNavItem\[\] = \[[\s\S]*?\n\]\n\n// Two modes",
+    """// MEM_SIDEBAR_NAV: intentionally minimal on Linux and macOS.
 const SIDEBAR_NAV: SidebarNavItem[] = [
   {
     id: 'new-session',
@@ -228,7 +274,7 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
 )
 sidebar_text = re.sub(
     r"  // Contributed nav rows \(plugins pairing a page with a sidebar entry\)[\s\S]*?\n  const panesFlipped =",
-    """  // FPP keeps optional workspace panels in Settings > Hidden Panels.
+    """  // MEM keeps optional workspace panels in Settings > Hidden Panels.
   const contributedNav: SidebarNavItem[] = []
 
   const panesFlipped =""",
@@ -338,9 +384,6 @@ text = re.sub(
     text,
 )
 text = text.replace("        <TitlebarToolButton navigate={navigate} tool={rightSidebarTool} />\n", "")
-# New Hermes versions keep layout/keybind tools in the array even after the old
-# removal patterns. Filter at the rendering boundary so only the sidebar toggle
-# and settings gear remain visible, exactly like the original Linux FPP UI.
 text = text.replace(
     "const visibleSystemTools = systemTools.filter(tool => !tool.hidden)",
     "const visibleSystemTools = systemTools.filter(tool => !tool.hidden && tool.id === 'settings')",
@@ -353,7 +396,7 @@ titlebar.write_text(text, encoding="utf-8")
 
 layout_store = desktop / "src/store/layout.ts"
 layout_store_text = layout_store.read_text(encoding="utf-8")
-if "FPP_FILE_BROWSER_HIDDEN" not in layout_store_text:
+if "MEM_FILE_BROWSER_HIDDEN" not in layout_store_text:
     layout_store_text = layout_store_text.replace(
         """ensurePaneRegistered(CHAT_SIDEBAR_PANE_ID, { open: true })
 ensurePaneRegistered(FILE_BROWSER_PANE_ID, { open: false })
@@ -362,16 +405,16 @@ ensurePaneRegistered(PREVIEW_PANE_ID, { open: true })""",
 ensurePaneRegistered(FILE_BROWSER_PANE_ID, { open: false })
 ensurePaneRegistered(PREVIEW_PANE_ID, { open: true })
 
-// FPP_FILE_BROWSER_HIDDEN: migrate existing installations once so the main
+// MEM_FILE_BROWSER_HIDDEN: migrate existing installations once so the main
 // chat opens cleanly. Afterwards the user's choice in Settings > Hidden Panels
 // is preserved normally across launches.
-const FPP_FILE_BROWSER_HIDDEN_KEY = 'hermes.fpp.fileBrowserHidden.v1'
+const MEM_FILE_BROWSER_HIDDEN_KEY = 'hermes.mem.fileBrowserHidden.v1'
 
 if (typeof window !== 'undefined') {
   try {
-    if (window.localStorage.getItem(FPP_FILE_BROWSER_HIDDEN_KEY) !== '1') {
+    if (window.localStorage.getItem(MEM_FILE_BROWSER_HIDDEN_KEY) !== '1') {
       setPaneOpen(FILE_BROWSER_PANE_ID, false)
-      window.localStorage.setItem(FPP_FILE_BROWSER_HIDDEN_KEY, '1')
+      window.localStorage.setItem(MEM_FILE_BROWSER_HIDDEN_KEY, '1')
     }
   } catch {
     setPaneOpen(FILE_BROWSER_PANE_ID, false)
@@ -503,7 +546,7 @@ replace(
     """  | 'gateway'
   | 'keys'""",
     """  | 'gateway'
-  | 'fpp'
+  | 'mem'
   | 'hidden-panels'
   | 'keys'""",
 )
@@ -513,7 +556,7 @@ replace(
   | 'hidden-panels'
   | 'keys'""",
     """  | 'gateway'
-  | 'fpp'
+  | 'mem'
   | 'hidden-panels'
   | 'keys'""",
 )
@@ -532,19 +575,19 @@ replace(
 replace(
     settings_index,
     "import { GatewaySettings } from './gateway-settings'\n",
-    "import { GatewaySettings } from './gateway-settings'\nimport { FppSettings } from './fpp-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
+    "import { GatewaySettings } from './gateway-settings'\nimport { MemSettings } from './mem-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
 )
 replace(
     settings_index,
     "import { GatewaySettings } from './gateway-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
-    "import { GatewaySettings } from './gateway-settings'\nimport { FppSettings } from './fpp-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
+    "import { GatewaySettings } from './gateway-settings'\nimport { MemSettings } from './mem-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
 )
 replace(
     settings_index,
     """  'gateway',
   'keys',""",
     """  'gateway',
-  'fpp',
+  'mem',
   'hidden-panels',
   'keys',""",
 )
@@ -554,7 +597,7 @@ replace(
   'hidden-panels',
   'keys',""",
     """  'gateway',
-  'fpp',
+  'mem',
   'hidden-panels',
   'keys',""",
 )
@@ -575,10 +618,10 @@ replace(
             onClick={() => setActiveView('mcp')}
           />
           <OverlayNavItem
-            active={activeView === 'fpp'}
+            active={activeView === 'mem'}
             icon={Brain}
-            label="FPP"
-            onClick={() => setActiveView('fpp')}
+            label="Hermes Mem"
+            onClick={() => setActiveView('mem')}
           />
           <OverlayNavItem
             active={activeView === 'hidden-panels'}
@@ -606,10 +649,10 @@ replace(
             onClick={() => setActiveView('mcp')}
           />
           <OverlayNavItem
-            active={activeView === 'fpp'}
+            active={activeView === 'mem'}
             icon={Brain}
-            label="FPP"
-            onClick={() => setActiveView('fpp')}
+            label="Hermes Mem"
+            onClick={() => setActiveView('mem')}
           />
           <OverlayNavItem
             active={activeView === 'hidden-panels'}""",
@@ -621,8 +664,8 @@ replace(
           ) : activeView === 'notifications' ? (""",
     """          ) : activeView === 'mcp' ? (
             <McpSettings gateway={gateway} onConfigSaved={onConfigSaved} />
-          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
+          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
           ) : activeView === 'hidden-panels' ? (
             <HiddenPanelsSettings />
           ) : activeView === 'notifications' ? (""",
@@ -634,8 +677,8 @@ replace(
           ) : activeView === 'hidden-panels' ? (""",
     """          ) : activeView === 'mcp' ? (
             <McpSettings gateway={gateway} onConfigSaved={onConfigSaved} />
-          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
+          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
           ) : activeView === 'hidden-panels' ? (""",
 )
 
@@ -646,18 +689,17 @@ replace(
           ) : activeView === 'notifications' ? (""",
     """          ) : activeView === 'mcp' ? (
             <McpSettings gateway={gateway} onConfigSaved={onConfigSaved} />
-          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
+          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
           ) : activeView === 'notifications' ? (""",
 )
 
-# Hermes 0.18+ uses data-driven OverlayNav groups instead of OverlayNavItem.
 replace(
     types,
     """  | 'gateway'
   | 'keybinds'""",
     """  | 'gateway'
-  | 'fpp'
+  | 'mem'
   | 'hidden-panels'
   | 'keybinds'""",
 )
@@ -668,7 +710,7 @@ replace(
   'keybinds',""",
     """  'providers',
   'gateway',
-  'fpp',
+  'mem',
   'hidden-panels',
   'keybinds',""",
 )
@@ -691,11 +733,11 @@ replace(
       onSelect: () => setActiveView('gateway')
     },
     {
-      active: activeView === 'fpp',
+      active: activeView === 'mem',
       icon: Brain,
-      id: 'fpp',
-      label: 'FPP',
-      onSelect: () => setActiveView('fpp')
+      id: 'mem',
+      label: 'Hermes Mem',
+      onSelect: () => setActiveView('mem')
     },
     {
       active: activeView === 'hidden-panels',
@@ -714,15 +756,325 @@ replace(
           ) : activeView === 'keybinds' ? (""",
     """          ) : activeView === 'gateway' ? (
             <GatewaySettings />
-          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
+          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
           ) : activeView === 'hidden-panels' ? (
             <HiddenPanelsSettings />
           ) : activeView === 'keybinds' ? (""",
 )
 
-fpp_settings = desktop / "src/app/settings/fpp-settings.tsx"
-fpp_settings.write_text(r'''import { useEffect, useState } from 'react'
+memory_dashboard_settings = desktop / "src/app/settings/memory-dashboard-settings.tsx"
+memory_dashboard_settings.write_text(r'''import { useEffect, useState } from 'react'
+
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Brain, Clock, RefreshCw, Search, Trash2 } from '@/lib/icons'
+import { notify, notifyError } from '@/store/notifications'
+
+import { Pill } from './primitives'
+
+type MemoryScope = 'all' | 'long-term' | '10-day' | 'events'
+
+interface MemorySearchItem {
+  id?: string
+  type?: string
+  day?: string
+  text?: string
+  title?: string
+  created_at?: string
+  updated_at?: string
+}
+
+interface MemoryChunk {
+  id: string
+  text: string
+  created_at?: string
+}
+
+interface MemoryDay {
+  day: string
+  chars: number
+  chunks: MemoryChunk[]
+}
+
+interface ForeverFact {
+  id: string
+  fact: string
+  category?: string
+  importance?: number
+}
+
+interface ActiveEvent {
+  id: string
+  title: string
+  description?: string
+  summary?: string
+  start_at?: string
+  end_at?: string
+}
+
+interface MemoryDashboardData {
+  today: { date: string; human: string; timezone: string }
+  today_memory: MemoryDay
+  ten_day_memory: MemoryDay[]
+  forever_facts: ForeverFact[]
+  active_events: ActiveEvent[]
+  search: { query: string; scope: MemoryScope; results: MemorySearchItem[] }
+  health: { active_chunks?: number; chat_sessions?: number; chat_notes?: number }
+}
+
+function memoryLabel(type?: string) {
+  const labels: Record<string, string> = {
+    chat_note: '10-day chat note',
+    chat_session: '10-day chat',
+    day_chunk: '10-day detail',
+    event: 'Event',
+    event_trace: 'Event trace',
+    forever_fact: 'Long-term fact'
+  }
+  return labels[type || ''] || type || 'Memory'
+}
+
+function MemoryText({ text, meta }: { text: string; meta?: string }) {
+  return (
+    <div className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary) px-3 py-2.5">
+      {meta && <div className="mb-1 text-[0.7rem] font-medium text-(--ui-text-tertiary)">{meta}</div>}
+      <div className="whitespace-pre-wrap break-words text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-secondary)">
+        {text}
+      </div>
+    </div>
+  )
+}
+
+export function MemoryDashboardSettings() {
+  const [dashboard, setDashboard] = useState<MemoryDashboardData | null>(null)
+  const [query, setQuery] = useState('')
+  const [scope, setScope] = useState<MemoryScope>('all')
+  const [loading, setLoading] = useState(true)
+  const [deleting, setDeleting] = useState(false)
+  const [confirmation, setConfirmation] = useState('')
+
+  const loadMemory = async (nextQuery = query, nextScope = scope) => {
+    setLoading(true)
+    try {
+      const data = (await window.hermesDesktop.memory.dashboard({
+        query: nextQuery.trim(),
+        scope: nextScope
+      })) as MemoryDashboardData
+      setDashboard(data)
+    } catch (err) {
+      notifyError(err, 'Failed to load memory')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadMemory('', 'all')
+  }, [])
+
+  const clearMemory = async () => {
+    if (confirmation !== 'DELETE_ALL_MEMORY') {
+      return
+    }
+    setDeleting(true)
+    try {
+      await window.hermesDesktop.memory.clearAll({ confirmation })
+      setConfirmation('')
+      setQuery('')
+      triggerReload()
+      notify({ kind: 'success', title: 'Memory deleted', message: 'All Hermes Mem records were deleted.' })
+    } catch (err) {
+      notifyError(err, 'Failed to delete memory')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const triggerReload = () => {
+    void loadMemory('', scope)
+  }
+
+  const searchResults = dashboard?.search.results || []
+  const todayChunks = dashboard?.today_memory.chunks || []
+
+  return (
+    <div className="mt-5 space-y-5">
+      <div>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div className="inline-flex items-center gap-2 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+            <Brain className="size-4" />
+            Memory overview
+          </div>
+          <Button disabled={loading} onClick={triggerReload} size="sm" type="button" variant="outline">
+            <RefreshCw className="mr-1.5 size-3.5" />
+            Refresh
+          </Button>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Pill>{dashboard?.forever_facts.length || 0} long-term facts</Pill>
+          <Pill>{dashboard?.ten_day_memory.length || 0} retained days</Pill>
+          <Pill>{dashboard?.active_events.length || 0} active events</Pill>
+          {dashboard?.today && <Pill>{dashboard.today.timezone}</Pill>}
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-2 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+          Search memory
+        </div>
+        <div className="flex flex-col gap-2 @2xl:flex-row">
+          <Input
+            aria-label="Search memory"
+            onChange={event => setQuery(event.currentTarget.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter') {
+                void loadMemory()
+              }
+            }}
+            placeholder="Search facts, events, chats, and daily memory"
+            value={query}
+          />
+          <div className="flex gap-1">
+            {(['all', 'long-term', '10-day', 'events'] as const).map(value => (
+              <Button
+                key={value}
+                onClick={() => {
+                  setScope(value)
+                  void loadMemory(query, value)
+                }}
+                size="sm"
+                type="button"
+                variant={scope === value ? 'default' : 'outline'}
+              >
+                {value === 'all' ? 'All' : value === 'long-term' ? 'Long-term' : value === '10-day' ? '10-day' : 'Events'}
+              </Button>
+            ))}
+          </div>
+          <Button disabled={loading} onClick={() => void loadMemory()} size="sm" type="button">
+            <Search className="mr-1.5 size-3.5" />
+            Search
+          </Button>
+        </div>
+        {dashboard?.search.query && (
+          <div className="mt-3 space-y-2">
+            {searchResults.length ? (
+              searchResults.map((item, index) => (
+                <MemoryText
+                  key={item.id || `${item.type}-${index}`}
+                  meta={`${memoryLabel(item.type)}${item.day ? ` · ${item.day}` : ''}`}
+                  text={item.text || item.title || 'Empty memory record'}
+                />
+              ))
+            ) : (
+              <div className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+                No matching memory found.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <div className="mb-2 inline-flex items-center gap-2 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+          <Clock className="size-4" />
+          Today · {dashboard?.today.date || '—'}
+        </div>
+        <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+          {todayChunks.length ? (
+            todayChunks.map(chunk => <MemoryText key={chunk.id} meta={chunk.created_at} text={chunk.text} />)
+          ) : (
+            <MemoryText text="Nothing has been recorded today." />
+          )}
+        </div>
+      </div>
+
+      <div className="grid gap-5 @3xl:grid-cols-2">
+        <div>
+          <div className="mb-2 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+            Active events
+          </div>
+          <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+            {dashboard?.active_events.length ? (
+              dashboard.active_events.map(event => (
+                <MemoryText
+                  key={event.id}
+                  meta={[event.start_at, event.end_at].filter(Boolean).join(' → ') || 'Active now'}
+                  text={[event.title, event.summary || event.description].filter(Boolean).join('\n')}
+                />
+              ))
+            ) : (
+              <MemoryText text="No active events." />
+            )}
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-2 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+            Long-term facts
+          </div>
+          <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+            {dashboard?.forever_facts.length ? (
+              dashboard.forever_facts.map(fact => (
+                <MemoryText key={fact.id} meta={fact.category || 'fact'} text={fact.fact} />
+              ))
+            ) : (
+              <MemoryText text="No long-term facts saved." />
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-2 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+          Rolling 10-day memory
+        </div>
+        <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
+          {dashboard?.ten_day_memory.length ? (
+            [...dashboard.ten_day_memory].reverse().map(day => (
+              <MemoryText
+                key={day.day}
+                meta={`${day.day} · ${day.chunks.length} records · ${day.chars} characters`}
+                text={day.chunks.map(chunk => chunk.text).join('\n\n') || 'No active records'}
+              />
+            ))
+          ) : (
+            <MemoryText text="No 10-day memory saved." />
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3">
+        <div className="mb-1 inline-flex items-center gap-2 text-[length:var(--conversation-caption-font-size)] font-medium text-red-400">
+          <Trash2 className="size-4" />
+          Delete all memory
+        </div>
+        <p className="mb-3 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+          This permanently deletes long-term facts, events, 10-day memory, and memory chat cards. Regular Hermes Mem chat history is not deleted.
+        </p>
+        <div className="flex flex-col gap-2 @2xl:flex-row">
+          <Input
+            onChange={event => setConfirmation(event.currentTarget.value)}
+            placeholder="Type DELETE_ALL_MEMORY"
+            value={confirmation}
+          />
+          <Button
+            disabled={confirmation !== 'DELETE_ALL_MEMORY' || deleting}
+            onClick={() => void clearMemory()}
+            type="button"
+            variant="destructive"
+          >
+            {deleting ? 'Deleting…' : 'Delete all memory'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+''', encoding="utf-8")
+
+mem_settings = desktop / "src/app/settings/mem-settings.tsx"
+mem_settings.write_text(r'''import { useEffect, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -731,9 +1083,10 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Brain, Clock, KeyRound, Mic, Save } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
 
-import { ListRow, Pill, SectionHeading, SettingsContent } from './primitives'
+import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { MemoryDashboardSettings } from './memory-dashboard-settings'
 
-interface FppSettingsProps {
+interface MemSettingsProps {
   onConfigSaved?: () => void
 }
 
@@ -753,7 +1106,7 @@ function setNestedConfigValue(config: Record<string, unknown>, path: string[], v
   cursor[path[path.length - 1]] = value
 }
 
-export function FppSettings({ onConfigSaved }: FppSettingsProps) {
+export function MemSettings({ onConfigSaved }: MemSettingsProps) {
   const [apiKey, setApiKey] = useState('')
   const [voiceId, setVoiceId] = useState('')
   const [timeoutSeconds, setTimeoutSeconds] = useState('300')
@@ -780,7 +1133,7 @@ export function FppSettings({ onConfigSaved }: FppSettingsProps) {
           setTimeoutSeconds(timeout.trim())
         }
       })
-      .catch(err => notifyError(err, 'Failed to load FPP settings'))
+      .catch(err => notifyError(err, 'Failed to load Hermes Mem settings'))
       .finally(() => {
         if (!cancelled) {
           setLoading(false)
@@ -827,28 +1180,12 @@ export function FppSettings({ onConfigSaved }: FppSettingsProps) {
 
   return (
     <SettingsContent>
-      <SectionHeading icon={Brain} meta="FPP" title="FPP Edition" />
+      <SectionHeading icon={Brain} meta="Beta 0.1" title="Hermes Mem" />
       <p className="max-w-2xl text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
-        Clean chat, external memory, and voice settings for this Hermes build.
+        Independent community edition based on Hermes Agent by Nous Research, with clean chat, local memory, and voice settings.
       </p>
 
-      <div className="mt-5">
-        <div className="mb-1.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
-          Memory
-        </div>
-        <div className="divide-y divide-(--ui-stroke-tertiary)">
-          <ListRow
-            action={<Pill>Coming soon</Pill>}
-            description="Memory controls will be added here. The current MCP memory keeps working through Hermes tools."
-            title={
-              <span className="inline-flex min-w-0 items-center gap-2">
-                <Brain className="size-4 shrink-0 text-muted-foreground" />
-                <span className="truncate">Memory settings</span>
-              </span>
-            }
-          />
-        </div>
-      </div>
+      <MemoryDashboardSettings />
 
       <div className="mt-5">
         <div className="mb-1.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
@@ -935,31 +1272,25 @@ const INLINE_CODE_RE = /`[^`]*`/g
 const HTML_BLOCK_RE = /<[^>\n]+>/g
 const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(([^)]+)\)/g
 const URL_RE = /\bhttps?:\/\/\S+/gi
-const PATH_RE = /(?:~|\.{1,2}|\/)?(?:\/[\wА-Яа-яЁё .@%+=:,~_-]+){1,}|\b[\w.-]+\.(?:py|ts|tsx|js|jsx|json|yaml|yml|toml|md|txt|log|sh|sqlite3?|db|env)\b/gi
+const PATH_RE = /(?:~|\.{1,2}|\/)?(?:\/[\p{L}\p{N}_ .@%+=:,~_-]+){1,}|\b[\w.-]+\.(?:py|ts|tsx|js|jsx|json|yaml|yml|toml|md|txt|log|sh|sqlite3?|db|env)\b/giu
 const COMMAND_RE = /^\s*(?:\$|>|#)?\s*(?:sudo\s+)?(?:apt|dnf|pacman|emerge|npm|pnpm|yarn|pip|python3?|node|git|hermes|codex|curl|grep|rg|cd|cp|mv|rm|mkdir|chmod|chown|systemctl|journalctl|pkill)\b.*$/gim
 const TOOL_LABEL_RE = /^\s*(?:result|tool|mcp|memory\.[\w.-]+|code|json|output|log|traceback)\s*:?\s*/gim
 const BULLET_RE = /^\s*(?:[-+*•]|\d+[.)])\s+/gm
 const HEADER_RE = /^\s{0,3}#{1,6}\s*/gm
 const TABLE_LINE_RE = /^\s*\|.*\|\s*$/gm
 
-const TECHNICAL_DETAILS = 'Технические детали пропущены.'
+const TECHNICAL_DETAILS = 'Technical details omitted.'
 
 function normalizeTechnicalWords(text: string): string {
   return text
-    .replace(/\bGPT[- ]?5\.5\b/gi, 'джипити пять пять')
-    .replace(/\bGPT[- ]?5\b/gi, 'джипити пять')
-    .replace(/\bCtrl\+V\b/gi, 'контрол ви')
-    .replace(/\bCtrl\+C\b/gi, 'контрол си')
-    .replace(/\bCtrl\+Z\b/gi, 'контрол зет')
-    .replace(/\bHermes\b/g, 'Гермес')
-    .replace(/\bElevenLabs\b/gi, 'элевен лабс')
-    .replace(/\bAPI\b/g, 'апи')
-    .replace(/\bTTS\b/g, 'ти ти эс')
-    .replace(/\bMCP\b/g, 'эм си пи')
-    .replace(/\bArch\b/g, 'арч')
-    .replace(/\bGentoo\b/g, 'дженту')
-    .replace(/\bLinux\b/g, 'линукс')
-    .replace(/\bGitHub\b/gi, 'гитхаб')
+    .replace(/\bGPT[- ]?5\.5\b/gi, 'G P T five point five')
+    .replace(/\bGPT[- ]?5\b/gi, 'G P T five')
+    .replace(/\bCtrl\+V\b/gi, 'Control V')
+    .replace(/\bCtrl\+C\b/gi, 'Control C')
+    .replace(/\bCtrl\+Z\b/gi, 'Control Z')
+    .replace(/\bAPI\b/g, 'A P I')
+    .replace(/\bTTS\b/g, 'T T S')
+    .replace(/\bMCP\b/g, 'M C P')
 }
 
 function cleanForVoice(text: string): string {
@@ -1000,7 +1331,7 @@ export function prepareTextForTTS(text: string): string {
   }
 
   return cleaned
-    .replace(/(?:Технические детали пропущены\.\s*){2,}/g, TECHNICAL_DETAILS)
+    .replace(/(?:Technical details omitted\.\s*){2,}/g, TECHNICAL_DETAILS)
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -1129,9 +1460,6 @@ if "temporaryChatActive," not in context_menu_text:
   onStartTemporaryChat,
   temporaryChatActive,""",
     )
-# Remove any partial/duplicate insertion from older FPP patchers, then place the
-# toggle directly after Prompt snippets. They intentionally share one menu
-# group, matching the original compact Hermes UI.
 context_menu_text = re.sub(
     r"\n\s*(?:<DropdownMenuSeparator />\n\s*)?<ContextMenuItem icon=\{Clock\} onSelect=\{onStartTemporaryChat\}>[\s\S]*?</ContextMenuItem>",
     "",
@@ -1373,8 +1701,6 @@ if "async (storedSessionId: string, replaceRoute = false) => {\n      const clos
       const requestId = resumeRequestRef.current + 1""",
     )
 
-# Hermes 0.18+ moved this hook into an index module and centralized the
-# session.create payload in desktopSessionCreateParams().
 if "  $temporaryChatMode,\n" not in session_actions_text:
     session_actions_text = session_actions_text.replace(
         "  $messages,\n",
@@ -1593,16 +1919,11 @@ if "disable_mcp: bool = False" not in acp_server_text:
         logger.info("New session %s (cwd=%s, ephemeral=%s, disable_mcp=%s)", state.session_id, cwd, ephemeral, disable_mcp)""",
     )
 if "if not getattr(state, \"ephemeral\", False):\n                self.session_manager.save_session(session_id)" not in acp_server_text:
-    acp_server_text = acp_server_text.replace(
-        """        if result.get("messages"):
-            state.history = result["messages"]
-            # Persist updated history so sessions survive process restarts.
-            self.session_manager.save_session(session_id)""",
-        """        if result.get("messages"):
-            state.history = result["messages"]
-            # Persist updated history so sessions survive process restarts.
-            if not getattr(state, "ephemeral", False):
-                self.session_manager.save_session(session_id)""",
+    acp_server_text = re.sub(
+        r'(        if result\.get\("messages"\):\n            state\.history = result\["messages"\]\n)(?:            \#[^\n]*\n)?            self\.session_manager\.save_session\(session_id\)',
+        r'\1            if not getattr(state, "ephemeral", False):\n                self.session_manager.save_session(session_id)',
+        acp_server_text,
+        count=1,
     )
 if "if getattr(state, \"ephemeral\", False):\n            _disable_hermes_memory_tools(agent)" not in acp_server_text:
     acp_server_text = acp_server_text.replace(
@@ -1619,10 +1940,11 @@ acp_server.write_text(acp_server_text, encoding="utf-8")
 api_server = hermes_root / "gateway/platforms/api_server.py"
 api_server_text = api_server.read_text(encoding="utf-8")
 if "self._ephemeral_sessions: set[str] = set()" not in api_server_text:
-    api_server_text = api_server_text.replace(
-        "        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity\n",
-        "        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity\n        self._ephemeral_sessions: set[str] = set()\n",
-        1,
+    api_server_text = re.sub(
+        r'(?m)^(        self\._session_db: Optional\[Any\] = None)(?:\s+\#[^\n]*)?$',
+        r'\1\n        self._ephemeral_sessions: set[str] = set()',
+        api_server_text,
+        count=1,
     )
 if "def _is_hermes_memory_tool_name(value: object) -> bool:" not in api_server_text:
     api_server_text = api_server_text.replace(
@@ -1863,15 +2185,12 @@ tui_server_text = tui_server_text.replace(
     'if "hermes-memory" not in str(name).lower() and "hermes_memory" not in str(name).lower()',
     'if "hermes-memory" not in str(name).lower()\n        and "hermes_memory" not in str(name).lower()\n        and str(name).lower() != "session_search"',
 )
-# FPP_TUI_PRIVACY_SIGNATURE: keep the lazy Desktop/TUI agent factory aligned
-# with the privacy flags passed by session.new. Match the whole signature so
-# upstream parameters added between releases do not make this silently fail.
 tui_make_agent_signature = re.search(
     r"def _make_agent\(\n(?P<params>(?:    [^\n]*\n)+?)\):",
     tui_server_text,
 )
 if tui_make_agent_signature is None:
-    raise SystemExit("FPP patch validation failed: tui_gateway._make_agent signature not found")
+    raise SystemExit("Hermes Mem patch validation failed: tui_gateway._make_agent signature not found")
 privacy_parameter_lines = (
     "disable_memory_mcp: bool = False",
     "ephemeral_session: bool = False",
@@ -1955,12 +2274,12 @@ if "if session is None or session.get(\"agent\") is not agent:" in tui_server_te
     tui_server_text = tui_server_text.replace(
         """            if session is None or session.get("agent") is not agent:
                 return
-            # Cache safety: never rebuild the tool list once the conversation""",
+""",
         """            if session is None or session.get("agent") is not agent:
                 return
             if session.get("disable_memory_mcp") or session.get("ephemeral"):
                 return
-            # Cache safety: never rebuild the tool list once the conversation""",
+""",
         1,
     )
 if "enabled_override=_filter_hermes_memory_toolsets(_load_enabled_toolsets())" not in tui_server_text:
@@ -1982,9 +2301,6 @@ if "enabled_override=_filter_hermes_memory_toolsets(_load_enabled_toolsets())" n
         1,
     )
 
-# Validate the exact factory contract after all rewrites. Merely finding the
-# flag names elsewhere in this large module is not sufficient: that allowed a
-# broken build where callers passed the flags but _make_agent rejected them.
 tui_make_agent_signature = re.search(
     r"def _make_agent\(\n(?P<params>(?:    [^\n]*\n)+?)\):",
     tui_server_text,
@@ -1993,17 +2309,17 @@ if tui_make_agent_signature is None or not {
     "disable_memory_mcp: bool = False",
     "ephemeral_session: bool = False",
 }.issubset(set(line.strip().rstrip(",") for line in tui_make_agent_signature.group("params").splitlines())):
-    raise SystemExit("FPP patch validation failed: tui_gateway._make_agent privacy flags are missing")
-if "if session.get(\"ephemeral\"):\n        return\n    # Persist into the session's own profile db" not in tui_server_text:
+    raise SystemExit("Hermes Mem patch validation failed: tui_gateway._make_agent privacy flags are missing")
+if "if session.get(\"ephemeral\"):\n        return" not in tui_server_text:
     tui_server_text = tui_server_text.replace(
         """    if not key:
         return
-    # Persist into the session's own profile db""",
+""",
         """    if not key:
         return
     if session.get("ephemeral"):
         return
-    # Persist into the session's own profile db""",
+""",
         1,
     )
 if "if session.get(\"ephemeral\"):\n        yield None\n        return\n    db, close_db = None, False" not in tui_server_text:
@@ -2020,7 +2336,7 @@ if "if session.get(\"ephemeral\"):\n        yield None\n        return\n    db, 
 if "ephemeral = is_truthy_value(params.get(\"ephemeral\", False))" not in tui_server_text:
     tui_server_text = tui_server_text.replace(
         """    title = str(params.get("title") or "").strip()
-    # When set, this is a branch:""",
+""",
         """    title = str(params.get("title") or "").strip()
     ephemeral = is_truthy_value(params.get("ephemeral", False)) or is_truthy_value(params.get("temporary", False))
     disable_memory_mcp = (
@@ -2028,7 +2344,7 @@ if "ephemeral = is_truthy_value(params.get(\"ephemeral\", False))" not in tui_se
         or is_truthy_value(params.get("disable_memory_mcp", False))
         or is_truthy_value(params.get("disable_mcp", False))
     )
-    # When set, this is a branch:""",
+""",
         1,
     )
 if "\"disable_memory_mcp\": disable_memory_mcp," not in tui_server_text:
@@ -2093,10 +2409,10 @@ tui_server_text = tui_server_text.replace(
 )
 tui_server.write_text(tui_server_text, encoding="utf-8")
 
-tui_privacy_test = hermes_root / "tests/tui_gateway/test_fpp_temporary_chat.py"
+tui_privacy_test = hermes_root / "tests/tui_gateway/test_mem_temporary_chat.py"
 tui_privacy_test.parent.mkdir(parents=True, exist_ok=True)
 tui_privacy_test.write_text(
-    '''"""FPP regression coverage for Temporary chat agent construction."""
+    '''"""Hermes Mem regression coverage for Temporary chat agent construction."""
 
 from unittest.mock import MagicMock, patch
 
@@ -2150,8 +2466,7 @@ def test_temporary_agent_factory_accepts_privacy_flags_and_disables_persistence(
 tts_tool = hermes_root / "tools/tts_tool.py"
 if tts_tool.exists():
     tts_text = tts_tool.read_text(encoding="utf-8")
-    tts_patch = r'''# Markdown and technical-text preparation for TTS.
-_MD_CODE_BLOCK = re.compile(r'```[\s\S]*?(?:```|$)')
+    tts_patch = r'''_MD_CODE_BLOCK = re.compile(r'```[\s\S]*?(?:```|$)')
 _MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]+\)')
 _MD_URL = re.compile(r'https?://\S+')
 _MD_INLINE_CODE = re.compile(r'`[^`]*`')
@@ -2159,10 +2474,10 @@ _MD_HEADER = re.compile(r'^\s{0,3}#{1,6}\s*', flags=re.MULTILINE)
 _MD_LIST_ITEM = re.compile(r'^\s*(?:[-+*•]|\d+[.)])\s+', flags=re.MULTILINE)
 _MD_TABLE_LINE = re.compile(r'^\s*\|.*\|\s*$', flags=re.MULTILINE)
 _HTML_BLOCK = re.compile(r'<[^>\n]+>')
-_PATH_TOKEN = re.compile(r'(?:~|\.{1,2}|/)?(?:/[\wА-Яа-яЁё .@%+=:,~_-]+){1,}|\b[\w.-]+\.(?:py|ts|tsx|js|jsx|json|yaml|yml|toml|md|txt|log|sh|sqlite3?|db|env)\b', flags=re.IGNORECASE)
+_PATH_TOKEN = re.compile(r'(?:~|\.{1,2}|/)?(?:/[\w .@%+=:,~_-]+){1,}|\b[\w.-]+\.(?:py|ts|tsx|js|jsx|json|yaml|yml|toml|md|txt|log|sh|sqlite3?|db|env)\b', flags=re.IGNORECASE)
 _COMMAND_LINE = re.compile(r'^\s*(?:\$|>|#)?\s*(?:sudo\s+)?(?:apt|dnf|pacman|emerge|npm|pnpm|yarn|pip|python3?|node|git|hermes|codex|curl|grep|rg|cd|cp|mv|rm|mkdir|chmod|chown|systemctl|journalctl|pkill)\b.*$', flags=re.IGNORECASE | re.MULTILINE)
 _TOOL_LABEL = re.compile(r'^\s*(?:result|tool|mcp|memory\.[\w.-]+|code|json|output|log|traceback)\s*:?\s*', flags=re.IGNORECASE | re.MULTILINE)
-_TTS_TECHNICAL_DETAILS = 'Технические детали пропущены.'
+_TTS_TECHNICAL_DETAILS = 'Technical details omitted.'
 _DEFAULT_ELEVENLABS_TIMEOUT_SECONDS = 300
 
 
@@ -2189,20 +2504,14 @@ def _create_elevenlabs_client(ElevenLabs, api_key: str, tts_config: dict):
 
 def _normalize_tts_words(text: str) -> str:
     replacements = [
-        (r'\bGPT[- ]?5\.5\b', 'джипити пять пять'),
-        (r'\bGPT[- ]?5\b', 'джипити пять'),
-        (r'\bCtrl\+V\b', 'контрол ви'),
-        (r'\bCtrl\+C\b', 'контрол си'),
-        (r'\bCtrl\+Z\b', 'контрол зет'),
-        (r'\bHermes\b', 'Гермес'),
-        (r'\bElevenLabs\b', 'элевен лабс'),
-        (r'\bAPI\b', 'апи'),
-        (r'\bTTS\b', 'ти ти эс'),
-        (r'\bMCP\b', 'эм си пи'),
-        (r'\bArch\b', 'арч'),
-        (r'\bGentoo\b', 'дженту'),
-        (r'\bLinux\b', 'линукс'),
-        (r'\bGitHub\b', 'гитхаб'),
+        (r'\bGPT[- ]?5\.5\b', 'G P T five point five'),
+        (r'\bGPT[- ]?5\b', 'G P T five'),
+        (r'\bCtrl\+V\b', 'Control V'),
+        (r'\bCtrl\+C\b', 'Control C'),
+        (r'\bCtrl\+Z\b', 'Control Z'),
+        (r'\bAPI\b', 'A P I'),
+        (r'\bTTS\b', 'T T S'),
+        (r'\bMCP\b', 'M C P'),
     ]
     for pattern, value in replacements:
         text = re.sub(pattern, value, text, flags=re.IGNORECASE)
@@ -2225,7 +2534,7 @@ def prepare_text_for_tts(text: str) -> str:
     cleaned = _normalize_tts_words(cleaned)
     cleaned = re.sub(r'[,\u2013\u2014:;]+', ' ', cleaned)
     cleaned = re.sub(r'[*_#>|~\\\[\](){}"`]', ' ', cleaned)
-    cleaned = re.sub(r'[^\wА-Яа-яЁё.!? ]+', ' ', cleaned, flags=re.UNICODE)
+    cleaned = re.sub(r'[^\w.!? ]+', ' ', cleaned, flags=re.UNICODE)
     cleaned = re.sub(r'\.{2,}', '.', cleaned)
     cleaned = re.sub(r'[!?]{2,}', lambda match: match.group(0)[0], cleaned)
     cleaned = re.sub(r'\s*([.!?])\s*', r'\1 ', cleaned)
@@ -2233,7 +2542,7 @@ def prepare_text_for_tts(text: str) -> str:
     if not cleaned:
         return ''
 
-    cleaned = re.sub(r'(?:Технические детали пропущены\.\s*){2,}', _TTS_TECHNICAL_DETAILS, cleaned)
+    cleaned = re.sub(r'(?:Technical details omitted\.\s*){2,}', _TTS_TECHNICAL_DETAILS, cleaned)
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 
@@ -2295,6 +2604,33 @@ if not electron_main.exists():
     electron_main = desktop / "electron/main.ts"
 if electron_main.exists():
     electron_main_text = electron_main.read_text(encoding="utf-8")
+    electron_main_text = electron_main_text.replace("const APP_NAME = 'Hermes'", "const APP_NAME = 'Hermes Mem'")
+    electron_main_text = re.sub(
+        r"function resolveHermesVersion\(\) \{[\s\S]*?\n\}\n\n// Re-resolve",
+        "function resolveHermesVersion() {\n  return app.getVersion()\n}\n\n// Re-resolve",
+        electron_main_text,
+        count=1,
+    )
+    isolation_patch = r'''const MEM_INSTALL_HOME = process.env.HERMES_MEM_HOME || path.join(app.getPath('home'), '.hermes-mem')
+process.env.HERMES_HOME = path.join(MEM_INSTALL_HOME, 'hermes')
+process.env.HERMES_DESKTOP_USER_DATA_DIR = path.join(MEM_INSTALL_HOME, 'desktop-data')
+process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(MEM_INSTALL_HOME, 'browser-cache')
+
+'''
+    electron_main_text = re.sub(
+        r"const (?:FPP|MEM)_INSTALL_HOME =[^\n]+\nprocess\.env\.HERMES_HOME =[^\n]+\nprocess\.env\.HERMES_DESKTOP_USER_DATA_DIR =[^\n]+\nprocess\.env\.PLAYWRIGHT_BROWSERS_PATH =[^\n]+\n\n",
+        isolation_patch,
+        electron_main_text,
+        count=1,
+    )
+    if "const MEM_INSTALL_HOME =" not in electron_main_text:
+        isolation_anchor = "const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR\n"
+        if isolation_anchor not in electron_main_text:
+            raise RuntimeError("Hermes Desktop user-data initialization anchor was not found")
+        electron_main_text = electron_main_text.replace(
+            isolation_anchor,
+            isolation_patch + isolation_anchor,
+        )
     timeout_helpers = r'''
 const AUDIO_SPEAK_DEFAULT_TIMEOUT_MS = 300_000
 
@@ -2356,7 +2692,93 @@ function defaultTimeoutMsForHermesApiRequest(request) {
         "const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)",
         "const timeoutMs = resolveTimeoutMs(request?.timeoutMs, defaultTimeoutMsForHermesApiRequest(request))",
     )
+    memory_ipc = r'''function runHermesMemCommand(args) {
+  const executable = path.join(MEM_INSTALL_HOME, 'memory', 'venv', 'bin', 'ai-memory-mcp')
+  const config = path.join(MEM_INSTALL_HOME, 'memory', 'config.toml')
+  return new Promise((resolve, reject) => {
+    execFile(
+      executable,
+      ['--config', config, ...args],
+      {
+        env: { ...process.env, HERMES_MEM_HOME: MEM_INSTALL_HOME },
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 20_000
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(String(stderr || error.message || 'Hermes Mem command failed').trim()))
+          return
+        }
+        try {
+          resolve(JSON.parse(String(stdout || '{}')))
+        } catch {
+          reject(new Error('Hermes Mem returned invalid data'))
+        }
+      }
+    )
+  })
+}
+
+ipcMain.handle('hermes:memory:dashboard', async (_event, payload = {}) => {
+  const query = String(payload?.query || '').slice(0, 500)
+  const requestedScope = String(payload?.scope || 'all')
+  const scope = ['all', 'long-term', '10-day', 'events'].includes(requestedScope) ? requestedScope : 'all'
+  return runHermesMemCommand(['dashboard', '--query', query, '--scope', scope, '--limit', '40'])
+})
+
+ipcMain.handle('hermes:memory:clear-all', async (_event, payload = {}) => {
+  const confirmation = String(payload?.confirmation || '')
+  if (confirmation !== 'DELETE_ALL_MEMORY') {
+    throw new Error('Type DELETE_ALL_MEMORY to confirm')
+  }
+  return runHermesMemCommand(['clear-all', '--confirm', confirmation])
+})
+
+'''
+    if "ipcMain.handle('hermes:memory:dashboard'" not in electron_main_text:
+        memory_ipc_anchor = "ipcMain.handle('hermes:api', async (_event, request) => {"
+        if memory_ipc_anchor not in electron_main_text:
+            raise RuntimeError("Hermes Desktop API IPC anchor was not found")
+        electron_main_text = electron_main_text.replace(memory_ipc_anchor, memory_ipc + memory_ipc_anchor, 1)
+    electron_main_text = electron_main_text.replace(
+        "const scope = ['all', 'long-term', '10-day'].includes(requestedScope) ? requestedScope : 'all'",
+        "const scope = ['all', 'long-term', '10-day', 'events'].includes(requestedScope) ? requestedScope : 'all'",
+    )
     electron_main.write_text(electron_main_text, encoding="utf-8")
+
+preload = desktop / "electron/preload.ts"
+if preload.exists():
+    preload_text = preload.read_text(encoding="utf-8")
+    if "hermes:memory:dashboard" not in preload_text:
+        preload_anchor = "  api: request => ipcRenderer.invoke('hermes:api', request),\n"
+        memory_preload = """  memory: {
+    dashboard: payload => ipcRenderer.invoke('hermes:memory:dashboard', payload),
+    clearAll: payload => ipcRenderer.invoke('hermes:memory:clear-all', payload)
+  },
+"""
+        if preload_anchor not in preload_text:
+            raise RuntimeError("Hermes Desktop preload API anchor was not found")
+        preload_text = preload_text.replace(preload_anchor, memory_preload + preload_anchor, 1)
+    preload.write_text(preload_text, encoding="utf-8")
+
+global_types = desktop / "src/global.d.ts"
+if global_types.exists():
+    global_types_text = global_types.read_text(encoding="utf-8")
+    global_types_text = global_types_text.replace(
+        "scope?: 'all' | 'long-term' | '10-day'",
+        "scope?: 'all' | 'long-term' | '10-day' | 'events'",
+    )
+    if "clearAll: (payload: { confirmation: string })" not in global_types_text:
+        global_types_anchor = "      api: <T>(request: HermesApiRequest) => Promise<T>\n"
+        memory_global_types = """      memory: {
+        dashboard: (payload?: { query?: string; scope?: 'all' | 'long-term' | '10-day' | 'events' }) => Promise<unknown>
+        clearAll: (payload: { confirmation: string }) => Promise<unknown>
+      }
+"""
+        if global_types_anchor not in global_types_text:
+            raise RuntimeError("Hermes Desktop global API type anchor was not found")
+        global_types_text = global_types_text.replace(global_types_anchor, memory_global_types + global_types_anchor, 1)
+    global_types.write_text(global_types_text, encoding="utf-8")
 
 hidden_panels = desktop / "src/app/settings/hidden-panels-settings.tsx"
 hidden_panels.write_text(r'''import { useStore } from '@nanostores/react'
@@ -2545,58 +2967,58 @@ while "import { HiddenPanelsSettings } from './hidden-panels-settings'\nimport {
         "import { HiddenPanelsSettings } from './hidden-panels-settings'\n",
     )
 settings_index_text = settings_index_text.replace(
-    "import { FppSettings } from './fpp-settings'\nimport { FppSettings } from './fpp-settings'\n",
-    "import { FppSettings } from './fpp-settings'\n",
+    "import { MemSettings } from './mem-settings'\nimport { MemSettings } from './mem-settings'\n",
+    "import { MemSettings } from './mem-settings'\n",
 )
-while "import { FppSettings } from './fpp-settings'\nimport { FppSettings } from './fpp-settings'\n" in settings_index_text:
+while "import { MemSettings } from './mem-settings'\nimport { MemSettings } from './mem-settings'\n" in settings_index_text:
     settings_index_text = settings_index_text.replace(
-        "import { FppSettings } from './fpp-settings'\nimport { FppSettings } from './fpp-settings'\n",
-        "import { FppSettings } from './fpp-settings'\n",
+        "import { MemSettings } from './mem-settings'\nimport { MemSettings } from './mem-settings'\n",
+        "import { MemSettings } from './mem-settings'\n",
     )
 settings_index_text = settings_index_text.replace(
-    "import { FppSettings } from './fpp-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\nimport { FppSettings } from './fpp-settings'\n",
-    "import { FppSettings } from './fpp-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
+    "import { MemSettings } from './mem-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\nimport { MemSettings } from './mem-settings'\n",
+    "import { MemSettings } from './mem-settings'\nimport { HiddenPanelsSettings } from './hidden-panels-settings'\n",
 )
 settings_index_text = settings_index_text.replace("Archive, Bell, Brain, Brain,", "Archive, Bell, Brain,")
-settings_index_text = settings_index_text.replace("  'fpp',\n  'fpp',\n", "  'fpp',\n")
+settings_index_text = settings_index_text.replace("  'mem',\n  'mem',\n", "  'mem',\n")
 settings_index_text = settings_index_text.replace(
     "  'hidden-panels',\n  'hidden-panels',\n",
     "  'hidden-panels',\n",
 )
 settings_index_text = settings_index_text.replace(
     """          <OverlayNavItem
-            active={activeView === 'fpp'}
+            active={activeView === 'mem'}
             icon={Brain}
-            label="FPP"
-            onClick={() => setActiveView('fpp')}
+            label="Hermes Mem"
+            onClick={() => setActiveView('mem')}
           />
           <OverlayNavItem
-            active={activeView === 'fpp'}
+            active={activeView === 'mem'}
             icon={Brain}
-            label="FPP"
-            onClick={() => setActiveView('fpp')}
+            label="Hermes Mem"
+            onClick={() => setActiveView('mem')}
           />""",
     """          <OverlayNavItem
-            active={activeView === 'fpp'}
+            active={activeView === 'mem'}
             icon={Brain}
-            label="FPP"
-            onClick={() => setActiveView('fpp')}
+            label="Hermes Mem"
+            onClick={() => setActiveView('mem')}
           />""",
 )
 settings_index_text = settings_index_text.replace(
-    """          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
-          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
+    """          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
+          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
           ) :""",
-    """          ) : activeView === 'fpp' ? (
-            <FppSettings onConfigSaved={onConfigSaved} />
+    """          ) : activeView === 'mem' ? (
+            <MemSettings onConfigSaved={onConfigSaved} />
           ) :""",
 )
 deduped_lines = []
 seen_exact_imports = set()
 for line in settings_index_text.splitlines():
-    if line.startswith("import { FppSettings } from './fpp-settings'") or line.startswith(
+    if line.startswith("import { MemSettings } from './mem-settings'") or line.startswith(
         "import { HiddenPanelsSettings } from './hidden-panels-settings'"
     ):
         if line in seen_exact_imports:
@@ -2607,7 +3029,7 @@ settings_index_text = "\n".join(deduped_lines) + "\n"
 settings_index.write_text(settings_index_text, encoding="utf-8")
 
 types_text = types.read_text(encoding="utf-8")
-types_text = types_text.replace("  | 'fpp'\n  | 'fpp'\n", "  | 'fpp'\n")
+types_text = types_text.replace("  | 'mem'\n  | 'mem'\n", "  | 'mem'\n")
 types_text = types_text.replace("  | 'hidden-panels'\n  | 'hidden-panels'\n", "  | 'hidden-panels'\n")
 types.write_text(types_text, encoding="utf-8")
 
@@ -2639,7 +3061,7 @@ theme_context_text = theme_context.read_text(encoding="utf-8")
 theme_context_text = theme_context_text.replace("const RETIRED_SKINS = new Set(['nous-light', 'default', 'gold'])\n", "")
 theme_context_text = re.sub(
     r"const normalizeSkin = \(name: string \| null\): string =>\n\s*name && resolveTheme\(name\) && !RETIRED_SKINS\.has\(name\) \? name : DEFAULT_SKIN_NAME",
-    """// FPP_THEME_DEFAULT: the original Linux FPP appearance on every OS.
+    """// MEM_THEME_DEFAULT: the original Linux MEM appearance on every OS.
 const normalizeSkin = (_name: string | null): string => 'mono'""",
     theme_context_text,
     count=1,
@@ -2655,8 +3077,6 @@ theme_context.write_text(theme_context_text, encoding="utf-8")
 native_notifications = desktop / "src/store/native-notifications.ts"
 if native_notifications.exists():
     native_notifications_text = native_notifications.read_text(encoding="utf-8")
-    # Keep native OS notifications on both Linux and macOS. Older FPP builds
-    # disabled them globally; restore the upstream implementation when updating.
     native_notifications_text = native_notifications_text.replace(
         "const DEFAULT_PREFS: NativeNotificationPrefs = {\n  enabled: false,",
         "const DEFAULT_PREFS: NativeNotificationPrefs = {\n  enabled: true,",
@@ -2685,7 +3105,7 @@ if composer_context_menu.exists():
 styles = desktop / "src/styles.css"
 styles_text = styles.read_text(encoding="utf-8")
 readability_css = r"""
-/* FPP readable UI scale: Hermes defaults are compact; this keeps the clean UI
+/* MEM readable UI scale: Hermes defaults are compact; this keeps the clean UI
    but makes chat usable on large desktop monitors. */
 :root {
   --conversation-text-font-size: 0.96875rem;
@@ -2748,34 +3168,40 @@ body {
 }
 """
 styles_text = re.sub(
-    r"\n/\* FPP readable UI scale:.*?\n\[data-slot='composer-rich-input'\] \{\n  font-size: var\(--conversation-text-font-size\);\n\}\n",
+    r"\n/\* MEM readable UI scale:.*?\n\[data-slot='composer-rich-input'\] \{\n  font-size: var\(--conversation-text-font-size\);\n\}\n",
     "\n",
     styles_text,
     flags=re.DOTALL,
 )
 styles.write_text(styles_text.rstrip() + "\n" + readability_css.strip() + "\n", encoding="utf-8")
 
-# Fail loudly when an upstream Hermes update makes an essential replacement no
-# longer applicable. The previous patcher could print success after applying
-# only part of FPP, producing a build with subtly broken memory/privacy rules.
 required_markers = [
-    (fpp_settings, "export function FppSettings"),
+    (mem_settings, "export function MemSettings"),
+    (mem_settings, "<MemoryDashboardSettings />"),
+    (memory_dashboard_settings, "export function MemoryDashboardSettings"),
+    (memory_dashboard_settings, "DELETE_ALL_MEMORY"),
     (hidden_panels, "export function HiddenPanelsSettings"),
     (hidden_panels, "<FileBrowserPanelRow />"),
-    (settings_index, "<FppSettings"),
-    (sidebar, "FPP_SIDEBAR_NAV"),
+    (settings_index, "<MemSettings"),
+    (sidebar, "MEM_SIDEBAR_NAV"),
     (titlebar, "tool.id === 'settings'"),
     (store_session, "$temporaryChatMode"),
     (context_menu, "Temporary chat active"),
     (composer_index, 'data-slot="temporary-chat-chip"'),
-    (theme_context, "FPP_THEME_DEFAULT"),
-    (layout_store, "FPP_FILE_BROWSER_HIDDEN"),
+    (theme_context, "MEM_THEME_DEFAULT"),
+    (layout_store, "MEM_FILE_BROWSER_HIDDEN"),
     (session_actions_hook, "ephemeral: true"),
     (acp_session, "ephemeral"),
     (acp_server, "_disable_hermes_memory_tools"),
     (tui_privacy_test, "test_temporary_agent_factory_accepts_privacy_flags"),
-    (styles, "FPP readable UI scale"),
+    (styles, "MEM readable UI scale"),
 ]
+if electron_main.exists():
+    required_markers.append((electron_main, "hermes:memory:dashboard"))
+if preload.exists():
+    required_markers.append((preload, "hermes:memory:clear-all"))
+if global_types.exists():
+    required_markers.append((global_types, "clearAll: (payload: { confirmation: string })"))
 for backend_path in (api_server, tui_server):
     if backend_path.exists():
         required_markers.append((backend_path, "disable_memory_mcp"))
@@ -2786,7 +3212,7 @@ for required_path, marker in required_markers:
         missing_markers.append(f"{required_path}: {marker}")
 if missing_markers:
     details = "\n  - ".join(missing_markers)
-    raise SystemExit(f"FPP patch validation failed; upstream Hermes is incompatible:\n  - {details}")
+    raise SystemExit(f"Hermes Mem patch validation failed; upstream Hermes is incompatible:\n  - {details}")
 
 print("Hermes Desktop simple UI patch applied.")
 PY
