@@ -41,6 +41,8 @@ def event_status(start_at: str | None, end_at: str | None, zone: ZoneInfo, at: d
     current = at or now_in(zone)
     start = parse_datetime(start_at, zone)
     end = parse_datetime(end_at, zone)
+    if not start and not end:
+        return "unknown"
     if start and current < start:
         return "upcoming"
     if end and current > end:

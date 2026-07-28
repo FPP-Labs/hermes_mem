@@ -12,6 +12,12 @@ from .config import MemoryConfig
 from .time_utils import end_after_days, event_status, iso_now, now_in, parse_day, parse_datetime, today_payload
 
 
+PLAN_EVENT_TYPES = {"plan", "intent", "intention"}
+UNSCHEDULED_EVENT_TYPES = PLAN_EVENT_TYPES | {"idea", "possibility"}
+LIFECYCLE_EVENT_STATUSES = {"planned", "in_progress", "completed", "cancelled", "unknown"}
+OPEN_EVENT_STATUSES = {"planned", "upcoming", "in_progress", "active", "unknown"}
+
+
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
@@ -53,10 +59,18 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def _importance(value: Any, default: int = 5) -> int:
+    try:
+        return max(0, min(int(value), 10))
+    except (TypeError, ValueError):
+        return default
+
+
 class MemoryStore:
     """SQLite storage for Hermes memory.
 
-    The store has four durable layers:
+    The store has five durable layers:
+    - an automatic verbatim turn archive for the first N days;
     - rolling detailed day chunks for the last N days;
     - forever user facts;
     - forever events with links/traces to day memories.
@@ -70,6 +84,7 @@ class MemoryStore:
             config = MemoryConfig(
                 db_path=Path(db_path).expanduser(),
                 timezone=config.timezone,
+                exact_retention_days=config.exact_retention_days,
                 detailed_retention_days=config.detailed_retention_days,
                 chat_retention_days=config.chat_retention_days,
                 gradual_delete_chars=config.gradual_delete_chars,
@@ -111,6 +126,45 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );
+
+            CREATE TABLE IF NOT EXISTS exact_turns (
+                id TEXT PRIMARY KEY,
+                external_turn_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL DEFAULT '',
+                task_id TEXT NOT NULL DEFAULT '',
+                user_message TEXT NOT NULL,
+                assistant_message TEXT NOT NULL,
+                user_created_at TEXT NOT NULL,
+                assistant_created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                review_status TEXT NOT NULL DEFAULT 'pending',
+                reviewed_at TEXT,
+                deleted_at TEXT,
+                model TEXT NOT NULL DEFAULT '',
+                platform TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_exact_turns_session_time
+                ON exact_turns(session_id, assistant_created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_exact_turns_expiry
+                ON exact_turns(expires_at, review_status, deleted_at);
+
+            CREATE TABLE IF NOT EXISTS turn_consolidations (
+                id TEXT PRIMARY KEY,
+                exact_turn_id TEXT NOT NULL UNIQUE,
+                summary TEXT NOT NULL,
+                memory_kind TEXT NOT NULL DEFAULT 'observation',
+                memory_status TEXT NOT NULL DEFAULT 'unknown',
+                importance INTEGER NOT NULL DEFAULT 5,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(exact_turn_id) REFERENCES exact_turns(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_turn_consolidations_importance
+                ON turn_consolidations(importance DESC, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS day_chunks (
                 id TEXT PRIMARY KEY,
@@ -264,6 +318,14 @@ class MemoryStore:
 
     def _init_fts(self) -> None:
         self.conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS exact_turns_fts USING "
+            "fts5(id UNINDEXED, user_message, assistant_message)"
+        )
+        self.conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS turn_consolidations_fts USING "
+            "fts5(id UNINDEXED, summary)"
+        )
+        self.conn.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS day_chunks_fts USING fts5(id UNINDEXED, day UNINDEXED, text)"
         )
         self.conn.execute(
@@ -290,6 +352,379 @@ class MemoryStore:
 
     def get_today(self) -> dict[str, str]:
         return today_payload(self.zone)
+
+    def archive_exact_turn(
+        self,
+        *,
+        external_turn_id: str,
+        user_message: str,
+        assistant_message: str,
+        session_id: str = "",
+        task_id: str = "",
+        user_created_at: str | None = None,
+        assistant_created_at: str | None = None,
+        model: str = "",
+        platform: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently archive the exact visible text of one completed turn."""
+        external_id = external_turn_id.strip()
+        if not external_id:
+            raise ValueError("external_turn_id must not be empty")
+        user_text = str(user_message)
+        assistant_text = str(assistant_message)
+        if not user_text.strip() and not assistant_text.strip():
+            raise ValueError("user_message or assistant_message must not be empty")
+        existing = self.conn.execute(
+            "SELECT * FROM exact_turns WHERE external_turn_id = ?",
+            (external_id,),
+        ).fetchone()
+        if existing:
+            payload = self._exact_turn_payload(existing)
+            payload["duplicate"] = True
+            return payload
+
+        assistant_dt = parse_datetime(assistant_created_at, self.zone) or now_in(self.zone)
+        user_dt = parse_datetime(user_created_at, self.zone) or assistant_dt
+        assistant_iso = assistant_dt.isoformat(timespec="seconds")
+        user_iso = user_dt.isoformat(timespec="seconds")
+        expires_at = (assistant_dt + timedelta(days=self.config.exact_retention_days)).isoformat(
+            timespec="seconds"
+        )
+        exact_id = _id("exact")
+        self.conn.execute(
+            """
+            INSERT INTO exact_turns (
+                id, external_turn_id, session_id, task_id, user_message,
+                assistant_message, user_created_at, assistant_created_at,
+                expires_at, model, platform, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                exact_id,
+                external_id,
+                session_id.strip(),
+                task_id.strip(),
+                user_text,
+                assistant_text,
+                user_iso,
+                assistant_iso,
+                expires_at,
+                model.strip(),
+                platform.strip(),
+                _json(metadata),
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO exact_turns_fts (id, user_message, assistant_message)
+            VALUES (?, ?, ?)
+            """,
+            (exact_id, user_text, assistant_text),
+        )
+        rotation = self.rotate_exact_turns(at=assistant_iso, commit=False)
+        self.log_operation(
+            "archive_exact_turn",
+            {"exact_turn_id": exact_id, "external_turn_id": external_id},
+        )
+        self.conn.commit()
+        payload = self.get_exact_turn(exact_id)
+        payload["duplicate"] = False
+        payload["rotation"] = rotation
+        return payload
+
+    def get_exact_turn(self, exact_turn_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM exact_turns WHERE id = ?",
+            (exact_turn_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"exact turn not found: {exact_turn_id}")
+        return self._exact_turn_payload(row)
+
+    def _exact_turn_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload = _row_to_dict(row)
+        payload["metadata"] = _loads(payload.pop("metadata_json", "{}"))
+        return payload
+
+    def list_exact_turns(
+        self,
+        *,
+        session_id: str | None = None,
+        limit: int = 100,
+        include_expired_pending: bool = True,
+    ) -> list[dict[str, Any]]:
+        clauses = ["deleted_at IS NULL"]
+        values: list[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            values.append(session_id)
+        if not include_expired_pending:
+            clauses.append("expires_at >= ?")
+            values.append(iso_now(self.zone))
+        values.append(max(1, min(int(limit), 500)))
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM exact_turns
+            WHERE {' AND '.join(clauses)}
+            ORDER BY assistant_created_at DESC
+            LIMIT ?
+            """,
+            values,
+        ).fetchall()
+        return [self._exact_turn_payload(row) for row in rows]
+
+    def rotate_exact_turns(
+        self,
+        *,
+        at: str | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Delete expired verbatim text only after its semantic review succeeded."""
+        cutoff = (parse_datetime(at, self.zone) or now_in(self.zone)).isoformat(timespec="seconds")
+        rows = self.conn.execute(
+            """
+            SELECT id FROM exact_turns
+            WHERE deleted_at IS NULL
+              AND expires_at < ?
+              AND review_status IN ('reviewed', 'skipped')
+            """,
+            (cutoff,),
+        ).fetchall()
+        ids = [row["id"] for row in rows]
+        now = iso_now(self.zone)
+        for exact_id in ids:
+            self.conn.execute(
+                """
+                UPDATE exact_turns
+                SET user_message = '', assistant_message = '', deleted_at = ?
+                WHERE id = ?
+                """,
+                (now, exact_id),
+            )
+            self.conn.execute("DELETE FROM exact_turns_fts WHERE id = ?", (exact_id,))
+        pending = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM exact_turns
+            WHERE deleted_at IS NULL AND expires_at < ? AND review_status = 'pending'
+            """,
+            (cutoff,),
+        ).fetchone()
+        if ids:
+            self.log_operation("rotate_exact_turns", {"ids": ids, "cutoff": cutoff})
+        if commit:
+            self.conn.commit()
+        return {
+            "deleted_count": len(ids),
+            "deleted_ids": ids,
+            "expired_pending_review_count": int(pending["count"]),
+        }
+
+    def apply_turn_review(
+        self,
+        *,
+        exact_turn_id: str,
+        summary: str = "",
+        keep_long_term: bool = False,
+        memory_kind: str = "observation",
+        memory_status: str = "unknown",
+        importance: int = 5,
+        facts: list[dict[str, Any]] | None = None,
+        events: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Apply one model-produced semantic review to an exact source turn."""
+        source = self.get_exact_turn(exact_turn_id)
+        if source["review_status"] in {"reviewed", "skipped"}:
+            return {
+                "exact_turn_id": exact_turn_id,
+                "duplicate": True,
+                "review_status": source["review_status"],
+            }
+        now = iso_now(self.zone)
+        safe_importance = _importance(importance)
+        clean_summary = str(summary or "").strip()
+        keep = keep_long_term is True or str(keep_long_term).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        safe_metadata = metadata if isinstance(metadata, dict) else {}
+        safe_kind = str(memory_kind or "observation").strip() or "observation"
+        safe_status = str(memory_status or "unknown").strip() or "unknown"
+        consolidation_id = None
+        fact_results: list[dict[str, Any]] = []
+        event_results: list[dict[str, Any]] = []
+
+        if keep and clean_summary:
+            consolidation_id = _id("summary")
+            self.conn.execute(
+                """
+                INSERT INTO turn_consolidations (
+                    id, exact_turn_id, summary, memory_kind, memory_status,
+                    importance, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    consolidation_id,
+                    exact_turn_id,
+                    clean_summary,
+                    safe_kind,
+                    safe_status,
+                    safe_importance,
+                    now,
+                    now,
+                    _json({"source_exact_turn_id": exact_turn_id, **safe_metadata}),
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO turn_consolidations_fts (id, summary) VALUES (?, ?)",
+                (consolidation_id, clean_summary),
+            )
+
+            for item in facts or []:
+                if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+                    continue
+                try:
+                    saved_fact = self.save_forever_fact(
+                        str(item["text"]),
+                        category=str(item.get("category") or "user"),
+                        importance=_importance(item.get("importance"), safe_importance),
+                        source="automatic_turn_review",
+                        metadata={"source_exact_turn_id": exact_turn_id},
+                    )
+                except (TypeError, ValueError):
+                    continue
+                fact_results.append(saved_fact)
+
+            for item in events or []:
+                if not isinstance(item, dict) or not str(item.get("title") or "").strip():
+                    continue
+                event_title = str(item["title"]).strip()
+                event_type = str(item.get("event_type") or "event").strip() or "event"
+                event_importance = _importance(item.get("importance"), safe_importance)
+                try:
+                    existing_event = self.find_matching_event(event_title, event_type)
+                    if existing_event:
+                        requested_status = str(item.get("status") or "").strip() or None
+                        if existing_event["status"] in {"completed", "cancelled"}:
+                            requested_status = existing_event["status"]
+                        saved_event = self.update_event(
+                            existing_event["id"],
+                            description=str(item.get("description") or "").strip() or None,
+                            start_at=item.get("start_at") or None,
+                            end_at=item.get("end_at") or None,
+                            status=requested_status,
+                            summary=str(item.get("summary") or "").strip() or None,
+                            importance=max(int(existing_event["importance"]), event_importance),
+                        )
+                        saved_event["duplicate"] = True
+                    else:
+                        saved_event = self.create_event(
+                            title=event_title,
+                            event_type=event_type,
+                            description=str(item.get("description") or ""),
+                            start_at=item.get("start_at"),
+                            end_at=item.get("end_at"),
+                            status=str(item.get("status") or "") or None,
+                            importance=event_importance,
+                            summary=str(item.get("summary") or ""),
+                            metadata={"source_exact_turn_id": exact_turn_id},
+                            auto_link_existing=False,
+                        )
+                        saved_event["duplicate"] = False
+                    self.link_memory_to_event(
+                        saved_event["id"],
+                        "exact_turn",
+                        exact_turn_id,
+                        day=parse_day(source["assistant_created_at"], self.zone),
+                        note="automatic semantic review source",
+                        commit=False,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                event_results.append(saved_event)
+
+        review_status = "reviewed" if keep and clean_summary else "skipped"
+        self.conn.execute(
+            """
+            UPDATE exact_turns
+            SET review_status = ?, reviewed_at = ?
+            WHERE id = ?
+            """,
+            (review_status, now, exact_turn_id),
+        )
+        self.log_operation(
+            "apply_turn_review",
+            {
+                "exact_turn_id": exact_turn_id,
+                "review_status": review_status,
+                "consolidation_id": consolidation_id,
+            },
+        )
+        rotation = self.rotate_exact_turns(commit=False)
+        self.conn.commit()
+        return {
+            "exact_turn_id": exact_turn_id,
+            "duplicate": False,
+            "review_status": review_status,
+            "consolidation_id": consolidation_id,
+            "facts": fact_results,
+            "events": event_results,
+            "rotation": rotation,
+        }
+
+    def list_turn_consolidations(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM turn_consolidations
+            ORDER BY importance DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        payloads = []
+        for row in rows:
+            payload = _row_to_dict(row)
+            payload["metadata"] = _loads(payload.pop("metadata_json", "{}"))
+            payloads.append(payload)
+        return payloads
+
+    def _format_timestamp(self, value: str | None) -> str:
+        parsed = parse_datetime(value, self.zone)
+        if parsed is None:
+            return f"time unknown ({self.config.timezone})"
+        return f"{parsed.strftime('%d.%m.%Y %H:%M:%S')} {self.config.timezone}"
+
+    def _format_memory_marker(
+        self,
+        value: str | None,
+        *,
+        memory_kind: str | None = None,
+        memory_status: str | None = None,
+    ) -> str:
+        parts = [self._format_timestamp(value)]
+        if memory_kind:
+            parts.append(f"kind={memory_kind}")
+        if memory_status:
+            parts.append(f"status={memory_status}")
+        return " | ".join(parts)
+
+    def _format_search_result(self, item: dict[str, Any]) -> str:
+        timestamp = item.get("created_at") or item.get("updated_at") or item.get("start_at")
+        marker = self._format_memory_marker(
+            timestamp,
+            memory_kind=item.get("memory_kind"),
+            memory_status=item.get("memory_status"),
+        )
+        if item.get("type") == "exact_turn":
+            user_marker = self._format_timestamp(item.get("user_created_at"))
+            return (
+                f"[exact verbatim turn | source={item['id']}]\n"
+                f"  User exact quote [{user_marker}]: {item.get('user_quote') or '(empty)'}\n"
+                f"  Hermes exact quote [{marker}]: {item.get('assistant_quote') or '(empty)'}"
+            )
+        return f"[{item['type']} | {marker}] {item['text']}"
 
     def ensure_day(self, day: str) -> None:
         now = iso_now(self.zone)
@@ -433,6 +868,44 @@ class MemoryStore:
         if not cleaned:
             raise ValueError("fact must not be empty")
         now = iso_now(self.zone)
+        existing = next(
+            (
+                row
+                for row in self.conn.execute("SELECT * FROM forever_facts").fetchall()
+                if str(row["fact"]).strip().casefold() == cleaned.casefold()
+            ),
+            None,
+        )
+        if existing:
+            existing_metadata = _loads(existing["metadata_json"])
+            new_metadata = metadata if isinstance(metadata, dict) else {}
+            merged_metadata = {**existing_metadata, **new_metadata}
+            safe_importance = max(int(existing["importance"]), _importance(importance, 7))
+            self.conn.execute(
+                """
+                UPDATE forever_facts
+                SET category = ?, importance = ?, pinned = ?, updated_at = ?,
+                    metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    category,
+                    safe_importance,
+                    1 if pinned or bool(existing["pinned"]) else 0,
+                    now,
+                    _json(merged_metadata),
+                    existing["id"],
+                ),
+            )
+            self.conn.commit()
+            payload = self._fact_payload(
+                self.conn.execute(
+                    "SELECT * FROM forever_facts WHERE id = ?",
+                    (existing["id"],),
+                ).fetchone()
+            )
+            payload["duplicate"] = True
+            return payload
         fact_id = _id("fact")
         self.conn.execute(
             """
@@ -440,11 +913,28 @@ class MemoryStore:
                 (id, fact, category, importance, pinned, created_at, updated_at, source, metadata_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (fact_id, cleaned, category, int(importance), 1 if pinned else 0, now, now, source, _json(metadata)),
+            (
+                fact_id,
+                cleaned,
+                category,
+                _importance(importance, 7),
+                1 if pinned else 0,
+                now,
+                now,
+                source,
+                _json(metadata),
+            ),
         )
         self.conn.execute("INSERT INTO forever_facts_fts (id, fact) VALUES (?, ?)", (fact_id, cleaned))
         self.conn.commit()
-        return {"id": fact_id, "fact": cleaned, "category": category, "importance": int(importance), "pinned": pinned}
+        return {
+            "id": fact_id,
+            "fact": cleaned,
+            "category": category,
+            "importance": _importance(importance, 7),
+            "pinned": pinned,
+            "duplicate": False,
+        }
 
     def list_forever_facts(self, *, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -485,11 +975,28 @@ class MemoryStore:
         tz = timezone or self.config.timezone
         zone = self.zone if tz == self.config.timezone else MemoryConfig(db_path=self.db_path, timezone=tz).zoneinfo()
         now = iso_now(self.zone)
-        start_iso = parse_datetime(start_at, zone).isoformat(timespec="seconds") if start_at else now
+        normalized_type = event_type.strip().lower() or "event"
+        normalized_status = status.strip().lower() if status and status.strip() else None
+        is_undated_plan = not start_at and (
+            normalized_type in UNSCHEDULED_EVENT_TYPES or normalized_status in {"planned", "unknown"}
+        )
+        if start_at:
+            start_iso = parse_datetime(start_at, zone).isoformat(timespec="seconds")
+        elif is_undated_plan:
+            start_iso = None
+        else:
+            start_iso = now
         end_iso = parse_datetime(end_at, zone).isoformat(timespec="seconds") if end_at else None
-        if duration_days is not None and not end_iso:
+        if duration_days is not None and not end_iso and start_iso:
             end_iso = end_after_days(start_iso, int(duration_days), zone)
-        computed_status = status or event_status(start_iso, end_iso, zone)
+        if normalized_status:
+            stored_status = normalized_status
+        elif normalized_type in PLAN_EVENT_TYPES:
+            stored_status = "planned"
+        elif normalized_type in {"idea", "possibility"}:
+            stored_status = "unknown"
+        else:
+            stored_status = event_status(start_iso, end_iso, zone)
         event_id = _id("event")
         self.conn.execute(
             """
@@ -501,12 +1008,12 @@ class MemoryStore:
             (
                 event_id,
                 cleaned_title,
-                event_type,
+                normalized_type,
                 description.strip(),
                 start_iso,
                 end_iso,
                 tz,
-                computed_status,
+                stored_status,
                 int(importance),
                 summary.strip(),
                 now,
@@ -532,10 +1039,28 @@ class MemoryStore:
             raise KeyError(f"event not found: {event_id}")
         return self._event_payload(row)
 
+    def find_matching_event(self, title: str, event_type: str) -> dict[str, Any] | None:
+        normalized_title = title.strip().casefold()
+        normalized_type = event_type.strip().casefold() or "event"
+        if not normalized_title:
+            return None
+        for row in self.conn.execute("SELECT * FROM events ORDER BY updated_at DESC").fetchall():
+            if (
+                str(row["title"]).strip().casefold() == normalized_title
+                and str(row["event_type"]).strip().casefold() == normalized_type
+            ):
+                return self._event_payload(row)
+        return None
+
     def _event_payload(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = _row_to_dict(row)
         payload["metadata"] = _loads(payload.pop("metadata_json", "{}"))
-        payload["computed_status"] = event_status(payload.get("start_at"), payload.get("end_at"), self.zone)
+        temporal_status = event_status(payload.get("start_at"), payload.get("end_at"), self.zone)
+        lifecycle_status = str(payload.get("status") or "").strip().lower()
+        payload["temporal_status"] = temporal_status
+        payload["computed_status"] = (
+            lifecycle_status if lifecycle_status in LIFECYCLE_EVENT_STATUSES else temporal_status
+        )
         return payload
 
     def update_event(
@@ -611,9 +1136,34 @@ class MemoryStore:
         active = []
         for row in rows:
             payload = self._event_payload(row)
-            if event_status(payload.get("start_at"), payload.get("end_at"), self.zone, at=current) == "active":
+            temporal_status = event_status(payload.get("start_at"), payload.get("end_at"), self.zone, at=current)
+            lifecycle_status = str(payload.get("status") or "").strip().lower()
+            if lifecycle_status == "in_progress" or (
+                lifecycle_status not in {"planned", "completed", "cancelled", "unknown"}
+                and temporal_status == "active"
+            ):
                 active.append(payload)
         return active
+
+    def open_events(self, *, at: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        current = parse_datetime(at, self.zone) if at else now_in(self.zone)
+        rows = self.conn.execute(
+            "SELECT * FROM events ORDER BY importance DESC, created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        open_items = []
+        for row in rows:
+            payload = self._event_payload(row)
+            lifecycle_status = str(payload.get("status") or "").strip().lower()
+            temporal_status = event_status(payload.get("start_at"), payload.get("end_at"), self.zone, at=current)
+            effective_status = (
+                lifecycle_status if lifecycle_status in LIFECYCLE_EVENT_STATUSES else temporal_status
+            )
+            payload["temporal_status"] = temporal_status
+            payload["computed_status"] = effective_status
+            if effective_status in OPEN_EVENT_STATUSES:
+                open_items.append(payload)
+        return open_items
 
     def link_existing_day_memories_to_event(self, event_id: str) -> int:
         event = self.get_event(event_id)
@@ -910,7 +1460,10 @@ class MemoryStore:
         if notes:
             parts.append(
                 "Chat notes:\n"
-                + "\n".join(f"- [{note.get('day') or note.get('created_at')}] {note['text']}" for note in notes)
+                + "\n".join(
+                    f"- [{self._format_timestamp(note.get('created_at'))}] {note['text']}"
+                    for note in notes
+                )
             )
         context_text, truncated = self._fit_text("\n\n".join(parts), limit_chars)
         return {
@@ -921,6 +1474,7 @@ class MemoryStore:
                 {
                     "id": note.get("id"),
                     "day": note.get("day"),
+                    "created_at": note.get("created_at"),
                     "text": self._trace_text(str(note.get("text") or ""), limit=500),
                 }
                 for note in notes[:8]
@@ -958,7 +1512,7 @@ class MemoryStore:
         limit_chars = max_chars or self.config.max_context_chars
         linked_rows = self.conn.execute(
             """
-            SELECT l.*, c.text, c.deleted_at
+            SELECT l.*, c.text, c.deleted_at, c.created_at AS memory_created_at
             FROM event_memory_links l
             LEFT JOIN day_chunks c ON l.memory_type = 'day_chunk' AND c.id = l.memory_id
             WHERE l.event_id = ?
@@ -981,6 +1535,7 @@ class MemoryStore:
                     "day": row["day"],
                     "note": row["note"],
                     "text": text,
+                    "created_at": row["memory_created_at"] or row["created_at"],
                 }
             )
         traces = [
@@ -997,11 +1552,15 @@ class MemoryStore:
         if memories:
             text_parts.append("Linked detailed event memories:")
             for memory in memories:
-                text_parts.append(f"- {memory['day']}: {memory['text']}")
+                text_parts.append(
+                    f"- [{self._format_timestamp(memory.get('created_at'))}] {memory['text']}"
+                )
         if traces:
             text_parts.append("Short traces of removed detailed event memory:")
             for trace in traces:
-                text_parts.append(f"- {trace['day']}: {trace['text']}")
+                text_parts.append(
+                    f"- [{self._format_timestamp(trace.get('created_at'))}] {trace['text']}"
+                )
         context_text, truncated = self._fit_text("\n".join(text_parts), limit_chars)
         return {
             "event": event,
@@ -1164,7 +1723,7 @@ class MemoryStore:
                 _row_to_dict(row)
                 for row in self.conn.execute(
                     """
-                    SELECT id, day, text, role, source, turn_id, order_index, created_at
+                    SELECT id, day, text, role, source, turn_id, order_index, created_at, metadata_json
                     FROM day_chunks
                     WHERE day = ? AND deleted_at IS NULL
                     ORDER BY order_index
@@ -1172,7 +1731,17 @@ class MemoryStore:
                     (day,),
                 ).fetchall()
             ]
-            day_text = "\n\n".join(chunk["text"] for chunk in chunks)
+            day_entries = []
+            for chunk in chunks:
+                metadata = _loads(chunk.pop("metadata_json", "{}"))
+                chunk["metadata"] = metadata
+                marker = self._format_memory_marker(
+                    chunk.get("created_at"),
+                    memory_kind=metadata.get("memory_kind"),
+                    memory_status=metadata.get("memory_status"),
+                )
+                day_entries.append(f"[{marker}]\n{chunk['text']}")
+            day_text = "\n\n".join(day_entries)
             parts.append(f"## {day}\n{day_text}")
             day_payloads.append({"day": day, "chunks": chunks, "chars": len(day_text)})
         context_text, truncated = self._fit_text("\n\n".join(parts), max_chars or self.config.max_context_chars)
@@ -1192,20 +1761,79 @@ class MemoryStore:
         today = self.get_today()
         current_at = at or today["now"]
         active_events = self.active_events(at=current_at)
+        open_events = self.open_events(at=current_at)
         facts = self.list_forever_facts(limit=50)
+        consolidations = self.list_turn_consolidations(limit=30)
         detailed_budget = max(2_000, limit_chars // 2)
         detailed = self.get_10_day_detailed_memory(today=parse_day(current_at, self.zone), max_chars=detailed_budget)
         search_results = self.search(query, limit=self.config.max_search_items) if query and include_search else []
 
         sections = [f"Current local time: {today['human']} ({today['timezone']})."]
-        if facts:
-            sections.append("Permanent user facts:\n" + "\n".join(f"- {fact['fact']}" for fact in facts))
-        if active_events:
-            sections.append("Active events:\n" + "\n".join(f"- {self._format_event(event)}" for event in active_events))
         if query and search_results:
+            search_budget = max(800, min(5_000, limit_chars // 3))
+            rendered_results: list[str] = []
+            rendered_chars = 0
+            for item in search_results:
+                rendered = self._format_search_result(item)
+                if len(rendered) > search_budget - rendered_chars:
+                    if item.get("type") == "exact_turn":
+                        continue
+                    rendered = self._trace_text(rendered, limit=max(100, search_budget - rendered_chars))
+                if not rendered or rendered_chars + len(rendered) > search_budget:
+                    break
+                rendered_results.append("- " + rendered)
+                rendered_chars += len(rendered) + 2
+            if rendered_results:
+                sections.append(
+                    "Relevant memory search results. Only entries marked 'exact verbatim turn' "
+                    "may be presented as direct quotes:\n"
+                    + "\n".join(rendered_results)
+                )
+
+        search_exact_ids = {
+            str(item.get("id"))
+            for item in search_results
+            if item.get("type") == "exact_turn"
+        }
+        recent_budget = max(600, min(3_500, limit_chars // 4))
+        recent_lines: list[str] = []
+        recent_chars = 0
+        for item in self.recent_exact_quotes(limit=3):
+            if item["id"] in search_exact_ids:
+                continue
+            rendered = self._format_search_result(item)
+            if len(rendered) > recent_budget - recent_chars:
+                continue
+            recent_lines.append("- " + rendered)
+            recent_chars += len(rendered) + 2
+        if recent_lines:
             sections.append(
-                "Relevant memory search results:\n"
-                + "\n".join(f"- [{item['type']}] {item['text']}" for item in search_results)
+                "Most recent complete verbatim turns (10-day short-term memory):\n"
+                + "\n".join(recent_lines)
+            )
+
+        if facts:
+            sections.append(
+                "Permanent user facts:\n"
+                + "\n".join(
+                    f"- [{self._format_timestamp(fact.get('updated_at') or fact.get('created_at'))}] "
+                    f"{fact['fact']}"
+                    for fact in facts
+                )
+            )
+        if consolidations:
+            sections.append(
+                "Long-term schematic memory (summaries, never verbatim quotes):\n"
+                + "\n".join(
+                    f"- [{self._format_memory_marker(item.get('updated_at'), memory_kind=item.get('memory_kind'), memory_status=item.get('memory_status'))}] "
+                    f"{item['summary']}"
+                    for item in consolidations
+                )
+            )
+        if open_events:
+            sections.append(
+                "Current events and unresolved plans:\n"
+                + "\n".join(f"- {self._format_event(event)}" for event in open_events)
             )
         if include_detailed_memory and detailed["context_text"]:
             sections.append("Detailed 10-day memory:\n" + detailed["context_text"])
@@ -1213,7 +1841,9 @@ class MemoryStore:
         return {
             "today": today,
             "forever_fact_count": len(facts),
+            "long_term_summary_count": len(consolidations),
             "active_event_count": len(active_events),
+            "open_event_count": len(open_events),
             "detailed_memory": {
                 "day_count": len(detailed.get("days", [])),
                 "chars": sum(int(day.get("chars") or 0) for day in detailed.get("days", [])),
@@ -1225,6 +1855,7 @@ class MemoryStore:
                     "type": item.get("type"),
                     "id": item.get("id"),
                     "day": item.get("day"),
+                    "created_at": item.get("created_at") or item.get("updated_at"),
                     "text": self._trace_text(str(item.get("text") or ""), limit=500),
                 }
                 for item in search_results[:5]
@@ -1242,6 +1873,8 @@ class MemoryStore:
         if not fts:
             return []
         results: list[dict[str, Any]] = []
+        results.extend(self._search_exact_turns(fts, max_items))
+        results.extend(self._search_turn_consolidations(fts, max_items))
         results.extend(self._search_chat_sessions(fts, max_items))
         results.extend(self._search_chat_notes(fts, max_items))
         results.extend(self._search_day_chunks(fts, max_items))
@@ -1249,6 +1882,44 @@ class MemoryStore:
         results.extend(self._search_events(fts, max_items))
         results.extend(self._search_event_traces(fts, max_items))
         return results[:max_items]
+
+    def search_exact_quotes(self, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        """Search only active verbatim turns that are safe to quote directly."""
+        cleaned = query.strip()
+        if not cleaned:
+            return []
+        fts = _fts_query(cleaned)
+        if not fts:
+            return []
+        return self._search_exact_turns(fts, max(1, min(int(limit), 100)))
+
+    def recent_exact_quotes(self, *, limit: int = 3) -> list[dict[str, Any]]:
+        """Return the most recent active complete turns as quote-safe records."""
+        rows = self.list_exact_turns(
+            limit=max(1, min(int(limit), 20)),
+            include_expired_pending=False,
+        )
+        return [
+            {
+                "type": "exact_turn",
+                "id": row["id"],
+                "external_turn_id": row["external_turn_id"],
+                "session_id": row["session_id"],
+                "text": "\n".join(
+                    [
+                        f"User: {row['user_message']}",
+                        f"Hermes: {row['assistant_message']}",
+                    ]
+                ),
+                "user_quote": row["user_message"],
+                "assistant_quote": row["assistant_message"],
+                "created_at": row["assistant_created_at"],
+                "user_created_at": row["user_created_at"],
+                "expires_at": row["expires_at"],
+                "verbatim": True,
+            }
+            for row in rows
+        ]
 
     def memory_dashboard(
         self,
@@ -1265,8 +1936,8 @@ class MemoryStore:
         detailed = self.get_10_day_detailed_memory(today=today["date"], max_chars=200_000)
         today_memory = next((day for day in detailed["days"] if day["day"] == today["date"]), None)
         results = self.search(query, limit=100) if query.strip() else []
-        long_term_types = {"forever_fact"}
-        ten_day_types = {"day_chunk", "chat_session", "chat_note"}
+        long_term_types = {"forever_fact", "turn_consolidation"}
+        ten_day_types = {"exact_turn", "day_chunk", "chat_session", "chat_note"}
         event_types = {"event", "event_trace"}
         if normalized_scope == "long-term":
             results = [item for item in results if item.get("type") in long_term_types]
@@ -1278,6 +1949,8 @@ class MemoryStore:
             "today": today,
             "today_memory": today_memory or {"day": today["date"], "chunks": [], "chars": 0},
             "ten_day_memory": detailed["days"],
+            "exact_turns": self.list_exact_turns(limit=100, include_expired_pending=False),
+            "long_term_summaries": self.list_turn_consolidations(limit=100),
             "forever_facts": self.list_forever_facts(limit=100),
             "active_events": self.active_events(at=today["now"]),
             "search": {
@@ -1306,6 +1979,10 @@ class MemoryStore:
             "day_chunks",
             "turns",
             "days",
+            "turn_consolidations_fts",
+            "turn_consolidations",
+            "exact_turns_fts",
+            "exact_turns",
             "forever_facts_fts",
             "forever_facts",
             "events_fts",
@@ -1320,6 +1997,9 @@ class MemoryStore:
                 key: counts[key]
                 for key in (
                     "active_chunks",
+                    "exact_turns",
+                    "pending_turn_reviews",
+                    "long_term_summaries",
                     "forever_facts",
                     "events",
                     "event_traces",
@@ -1329,11 +2009,83 @@ class MemoryStore:
             },
         }
 
+    def _search_exact_turns(self, fts_query: str, limit: int) -> list[dict[str, Any]]:
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT t.id, t.external_turn_id, t.session_id, t.user_message,
+                       t.assistant_message, t.user_created_at, t.assistant_created_at,
+                       t.expires_at
+                FROM exact_turns_fts
+                JOIN exact_turns t ON t.id = exact_turns_fts.id
+                WHERE exact_turns_fts MATCH ?
+                  AND t.deleted_at IS NULL
+                  AND t.expires_at >= ?
+                ORDER BY bm25(exact_turns_fts)
+                LIMIT ?
+                """,
+                (fts_query, iso_now(self.zone), limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [
+            {
+                "type": "exact_turn",
+                "id": row["id"],
+                "external_turn_id": row["external_turn_id"],
+                "session_id": row["session_id"],
+                "text": "\n".join(
+                    [
+                        f"User: {row['user_message']}",
+                        f"Hermes: {row['assistant_message']}",
+                    ]
+                ),
+                "user_quote": row["user_message"],
+                "assistant_quote": row["assistant_message"],
+                "created_at": row["assistant_created_at"],
+                "user_created_at": row["user_created_at"],
+                "expires_at": row["expires_at"],
+                "verbatim": True,
+            }
+            for row in rows
+        ]
+
+    def _search_turn_consolidations(self, fts_query: str, limit: int) -> list[dict[str, Any]]:
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT c.*
+                FROM turn_consolidations_fts
+                JOIN turn_consolidations c ON c.id = turn_consolidations_fts.id
+                WHERE turn_consolidations_fts MATCH ?
+                ORDER BY bm25(turn_consolidations_fts)
+                LIMIT ?
+                """,
+                (fts_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [
+            {
+                "type": "turn_consolidation",
+                "id": row["id"],
+                "exact_turn_id": row["exact_turn_id"],
+                "text": row["summary"],
+                "memory_kind": row["memory_kind"],
+                "memory_status": row["memory_status"],
+                "importance": row["importance"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "verbatim": False,
+            }
+            for row in rows
+        ]
+
     def _search_day_chunks(self, fts_query: str, limit: int) -> list[dict[str, Any]]:
         try:
             rows = self.conn.execute(
                 """
-                SELECT c.id, c.day, c.text, c.created_at
+                SELECT c.id, c.day, c.text, c.created_at, c.metadata_json
                 FROM day_chunks_fts
                 JOIN day_chunks c ON c.id = day_chunks_fts.id
                 WHERE day_chunks_fts MATCH ? AND c.deleted_at IS NULL
@@ -1344,16 +2096,27 @@ class MemoryStore:
             ).fetchall()
         except sqlite3.OperationalError:
             return []
-        return [
-            {"type": "day_chunk", "id": row["id"], "day": row["day"], "text": row["text"], "created_at": row["created_at"]}
-            for row in rows
-        ]
+        results = []
+        for row in rows:
+            metadata = _loads(row["metadata_json"])
+            results.append(
+                {
+                    "type": "day_chunk",
+                    "id": row["id"],
+                    "day": row["day"],
+                    "text": row["text"],
+                    "created_at": row["created_at"],
+                    "memory_kind": metadata.get("memory_kind"),
+                    "memory_status": metadata.get("memory_status"),
+                }
+            )
+        return results
 
     def _search_facts(self, fts_query: str, limit: int) -> list[dict[str, Any]]:
         try:
             rows = self.conn.execute(
                 """
-                SELECT f.id, f.fact, f.category, f.importance
+                SELECT f.id, f.fact, f.category, f.importance, f.created_at, f.updated_at
                 FROM forever_facts_fts
                 JOIN forever_facts f ON f.id = forever_facts_fts.id
                 WHERE forever_facts_fts MATCH ?
@@ -1371,6 +2134,8 @@ class MemoryStore:
                 "text": row["fact"],
                 "category": row["category"],
                 "importance": row["importance"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
             }
             for row in rows
         ]
@@ -1398,6 +2163,7 @@ class MemoryStore:
                 "status": row["status"],
                 "start_at": row["start_at"],
                 "end_at": row["end_at"],
+                "created_at": row["created_at"],
             }
             for row in rows
         ]
@@ -1513,6 +2279,9 @@ class MemoryStore:
             """
             SELECT
                 (SELECT COUNT(*) FROM day_chunks WHERE deleted_at IS NULL) AS active_chunks,
+                (SELECT COUNT(*) FROM exact_turns WHERE deleted_at IS NULL) AS exact_turns,
+                (SELECT COUNT(*) FROM exact_turns WHERE deleted_at IS NULL AND review_status = 'pending') AS pending_turn_reviews,
+                (SELECT COUNT(*) FROM turn_consolidations) AS long_term_summaries,
                 (SELECT COUNT(*) FROM forever_facts) AS forever_facts,
                 (SELECT COUNT(*) FROM events) AS events,
                 (SELECT COUNT(*) FROM event_traces) AS event_traces,
@@ -1529,10 +2298,19 @@ class MemoryStore:
         }
 
     def _format_event(self, event: dict[str, Any]) -> str:
-        parts = [event["title"]]
+        parts = [
+            event["title"],
+            f"type={event.get('event_type') or 'event'}",
+            f"recorded={self._format_timestamp(event.get('created_at'))}",
+        ]
         if event.get("start_at") or event.get("end_at"):
             parts.append(f"{event.get('start_at') or '?'} -> {event.get('end_at') or '?'}")
+        else:
+            parts.append("schedule=unknown")
         parts.append(f"status={event.get('computed_status') or event.get('status')}")
+        temporal_status = event.get("temporal_status")
+        if temporal_status and temporal_status != event.get("computed_status"):
+            parts.append(f"temporal_status={temporal_status}")
         if event.get("summary"):
             parts.append(event["summary"])
         elif event.get("description"):

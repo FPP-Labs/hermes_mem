@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 HERMES_ROOT="${HERMES_ROOT:-"$HOME/.hermes-mem/hermes/hermes-agent"}"
 DESKTOP_DIR="$HERMES_ROOT/apps/desktop"
+PATCH_ASSETS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../hermes-patches" && pwd)"
 DO_PACK=0
 
 usage() {
@@ -43,24 +44,27 @@ done
   exit 1
 }
 
-python3 - "$DESKTOP_DIR" <<'PY'
+python3 - "$DESKTOP_DIR" "$PATCH_ASSETS_DIR" <<'PY'
 from pathlib import Path
 import json
+import os
 import re
+import shutil
 import sys
 
 desktop = Path(sys.argv[1])
 hermes_root = desktop.parent.parent
+patch_assets = Path(sys.argv[2])
 
 package_json = desktop / "package.json"
 package_data = json.loads(package_json.read_text(encoding="utf-8"))
-package_data["version"] = "0.1.0-beta.1"
+package_data["version"] = "0.2.0-beta.1"
 package_data["productName"] = "Hermes Mem"
 package_data["description"] = "Independent community edition based on Hermes Agent by Nous Research."
 build = package_data.setdefault("build", {})
 build["appId"] = "app.hermesmem.desktop"
 build["productName"] = "Hermes Mem"
-build["artifactName"] = "Hermes-Mem-Beta-0.1-${os}-${arch}.${ext}"
+build["artifactName"] = "Hermes-Mem-Beta-0.2-${os}-${arch}.${ext}"
 build["protocols"] = [{"name": "Hermes Mem Protocol", "schemes": ["hermes-mem"]}]
 mac = build.setdefault("mac", {})
 extend_info = mac.setdefault("extendInfo", {})
@@ -1078,9 +1082,10 @@ mem_settings.write_text(r'''import { useEffect, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { getHermesConfigRecord, saveHermesConfig, setEnvVar } from '@/hermes'
 import { triggerHaptic } from '@/lib/haptics'
-import { Brain, Clock, KeyRound, Mic, Save } from '@/lib/icons'
+import { Brain, Clock, Globe, KeyRound, Mic, Save, Search } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
 
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
@@ -1089,6 +1094,8 @@ import { MemoryDashboardSettings } from './memory-dashboard-settings'
 interface MemSettingsProps {
   onConfigSaved?: () => void
 }
+
+type SearchProvider = 'ddgs' | 'searxng'
 
 function setNestedConfigValue(config: Record<string, unknown>, path: string[], value: unknown) {
   let cursor = config
@@ -1106,11 +1113,43 @@ function setNestedConfigValue(config: Record<string, unknown>, path: string[], v
   cursor[path[path.length - 1]] = value
 }
 
+function buildSearxngUrl(address: string, port: string): string {
+  const trimmedAddress = address.trim()
+  const parsedPort = Number(port.trim())
+
+  if (!trimmedAddress) {
+    throw new Error('Enter the SearXNG server IP address or hostname.')
+  }
+  if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+    throw new Error('Enter a SearXNG port between 1 and 65535.')
+  }
+
+  const withProtocol = /^https?:\/\//i.test(trimmedAddress) ? trimmedAddress : `http://${trimmedAddress}`
+  const url = new URL(withProtocol)
+
+  if (!url.hostname || !['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Enter a valid HTTP or HTTPS SearXNG server address.')
+  }
+  if (url.username || url.password) {
+    throw new Error('SearXNG credentials are not supported in the server address.')
+  }
+
+  url.port = String(parsedPort)
+  url.pathname = ''
+  url.search = ''
+  url.hash = ''
+  return url.origin
+}
+
 export function MemSettings({ onConfigSaved }: MemSettingsProps) {
+  const [searchProvider, setSearchProvider] = useState<SearchProvider>('ddgs')
+  const [searxngAddress, setSearxngAddress] = useState('')
+  const [searxngPort, setSearxngPort] = useState('8080')
   const [apiKey, setApiKey] = useState('')
   const [voiceId, setVoiceId] = useState('')
   const [timeoutSeconds, setTimeoutSeconds] = useState('300')
   const [loading, setLoading] = useState(true)
+  const [savingSearch, setSavingSearch] = useState(false)
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -1124,6 +1163,19 @@ export function MemSettings({ onConfigSaved }: MemSettingsProps) {
 
         const tts = (config.tts ?? {}) as Record<string, unknown>
         const elevenlabs = (tts.elevenlabs ?? {}) as Record<string, unknown>
+        const web = (config.web ?? {}) as Record<string, unknown>
+
+        setSearchProvider(web.search_backend === 'searxng' ? 'searxng' : 'ddgs')
+        if (typeof web.searxng_address === 'string') {
+          setSearxngAddress(web.searxng_address)
+        }
+        if (
+          (typeof web.searxng_port === 'number' && Number.isFinite(web.searxng_port)) ||
+          (typeof web.searxng_port === 'string' && web.searxng_port.trim())
+        ) {
+          setSearxngPort(String(web.searxng_port))
+        }
+
         setVoiceId(typeof elevenlabs.voice_id === 'string' ? elevenlabs.voice_id : '')
 
         const timeout = elevenlabs.timeout ?? elevenlabs.timeout_seconds
@@ -1144,6 +1196,38 @@ export function MemSettings({ onConfigSaved }: MemSettingsProps) {
       cancelled = true
     }
   }, [])
+
+  const saveSearch = async () => {
+    setSavingSearch(true)
+
+    try {
+      const config = await getHermesConfigRecord()
+      setNestedConfigValue(config, ['web', 'search_backend'], searchProvider)
+
+      if (searchProvider === 'searxng') {
+        const searxngUrl = buildSearxngUrl(searxngAddress, searxngPort)
+        await setEnvVar('SEARXNG_URL', searxngUrl)
+        setNestedConfigValue(config, ['web', 'searxng_address'], searxngAddress.trim())
+        setNestedConfigValue(config, ['web', 'searxng_port'], Number(searxngPort.trim()))
+      }
+
+      await saveHermesConfig(config)
+      triggerHaptic('success')
+      notify({
+        kind: 'success',
+        title: 'Search settings saved',
+        message:
+          searchProvider === 'ddgs'
+            ? 'DuckDuckGo is ready. Hermes can search automatically when current information is needed.'
+            : 'SearXNG is now the active search provider.'
+      })
+      onConfigSaved?.()
+    } catch (err) {
+      notifyError(err, 'Failed to save search settings')
+    } finally {
+      setSavingSearch(false)
+    }
+  }
 
   const saveVoice = async () => {
     setSaving(true)
@@ -1180,12 +1264,100 @@ export function MemSettings({ onConfigSaved }: MemSettingsProps) {
 
   return (
     <SettingsContent>
-      <SectionHeading icon={Brain} meta="Beta 0.1" title="Hermes Mem" />
+      <SectionHeading icon={Brain} meta="Beta 0.2" title="Hermes Mem" />
       <p className="max-w-2xl text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
         Independent community edition based on Hermes Agent by Nous Research, with clean chat, local memory, and voice settings.
       </p>
 
       <MemoryDashboardSettings />
+
+      <div className="mt-5">
+        <div className="mb-1.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
+          Search
+        </div>
+        <div className="divide-y divide-(--ui-stroke-tertiary)">
+          <ListRow
+            action={
+              <Select
+                disabled={loading}
+                onValueChange={value => setSearchProvider(value === 'searxng' ? 'searxng' : 'ddgs')}
+                value={searchProvider}
+              >
+                <SelectTrigger aria-label="Search provider" className="min-w-44">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ddgs">DuckDuckGo</SelectItem>
+                  <SelectItem value="searxng">SearXNG</SelectItem>
+                </SelectContent>
+              </Select>
+            }
+            description={
+              searchProvider === 'ddgs'
+                ? 'Works automatically without an API key or your own server.'
+                : 'Uses your self-hosted SearXNG server.'
+            }
+            title={
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <Search className="size-4 shrink-0 text-muted-foreground" />
+                <span className="truncate">Search provider</span>
+              </span>
+            }
+          />
+          {searchProvider === 'searxng' ? (
+            <>
+              <ListRow
+                action={
+                  <Input
+                    autoComplete="off"
+                    disabled={loading}
+                    onChange={event => setSearxngAddress(event.currentTarget.value)}
+                    placeholder="192.168.1.50 or search.example.com"
+                    value={searxngAddress}
+                  />
+                }
+                description="IP address or hostname. You may include http:// or https://."
+                title={
+                  <span className="inline-flex min-w-0 items-center gap-2">
+                    <Globe className="size-4 shrink-0 text-muted-foreground" />
+                    <span className="truncate">SearXNG server</span>
+                  </span>
+                }
+              />
+              <ListRow
+                action={
+                  <Input
+                    disabled={loading}
+                    max={65535}
+                    min={1}
+                    onChange={event => setSearxngPort(event.currentTarget.value)}
+                    placeholder="8080"
+                    type="number"
+                    value={searxngPort}
+                  />
+                }
+                description="The TCP port where the SearXNG web service is listening."
+                title="SearXNG port"
+              />
+            </>
+          ) : null}
+          <ListRow
+            action={
+              <Button
+                className="gap-1.5"
+                disabled={savingSearch || loading}
+                onClick={() => void saveSearch()}
+                type="button"
+              >
+                <Save className="size-3.5" />
+                Save search
+              </Button>
+            }
+            description="Hermes uses web search automatically for questions that need current or external information."
+            title="Apply search settings"
+          />
+        </div>
+      </div>
 
       <div className="mt-5">
         <div className="mb-1.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)">
@@ -1395,17 +1567,16 @@ store_session.write_text(store_session_text, encoding="utf-8")
 
 types_hermes = desktop / "src/types/hermes.ts"
 types_hermes_text = types_hermes.read_text(encoding="utf-8")
-if "session_key?: string" not in types_hermes_text:
-    types_hermes_text = types_hermes_text.replace(
-        """  messages?: SessionMessage[]
+types_hermes_text = types_hermes_text.replace(
+    """  messages?: SessionMessage[]
   session_id: string
   stored_session_id?: string""",
-        """  messages?: SessionMessage[]
+    """  messages?: SessionMessage[]
   session_id: string
   session_key?: string
   stored_session_id?: string""",
-        1,
-    )
+    1,
+)
 types_hermes.write_text(types_hermes_text, encoding="utf-8")
 
 desktop_controller = desktop / "src/app/desktop-controller.tsx"
@@ -3175,9 +3346,176 @@ styles_text = re.sub(
 )
 styles.write_text(styles_text.rstrip() + "\n" + readability_css.strip() + "\n", encoding="utf-8")
 
+autocapture_source = patch_assets / "hermes_mem_autocapture.py"
+autocapture_target = hermes_root / "agent/hermes_mem_autocapture.py"
+if not autocapture_source.exists():
+    raise SystemExit(f"Hermes Mem patch asset is missing: {autocapture_source}")
+autocapture_target.write_text(autocapture_source.read_text(encoding="utf-8"), encoding="utf-8")
+
+youtube_context_source = patch_assets / "hermes_youtube_transcript.py"
+youtube_context_target = hermes_root / "agent/hermes_youtube_transcript.py"
+if not youtube_context_source.exists():
+    raise SystemExit(f"Hermes Mem patch asset is missing: {youtube_context_source}")
+youtube_context_target.write_text(
+    youtube_context_source.read_text(encoding="utf-8"),
+    encoding="utf-8",
+)
+
+youtube_tool_source = patch_assets / "hermes_youtube_transcript_tool.py"
+youtube_tool_target = hermes_root / "tools/hermes_youtube_transcript_tool.py"
+if not youtube_tool_source.exists():
+    raise SystemExit(f"Hermes Mem patch asset is missing: {youtube_tool_source}")
+youtube_tool_target.write_text(youtube_tool_source.read_text(encoding="utf-8"), encoding="utf-8")
+legacy_youtube_tool = hermes_root / "tools/hermes_youtube_analyze_tool.py"
+legacy_youtube_tool.unlink(missing_ok=True)
+
+youtube_routing_test_source = patch_assets / "hermes_youtube_routing_regression.py"
+youtube_routing_test_target = hermes_root / "tests/tui_gateway/test_mem_youtube_routing.py"
+if not youtube_routing_test_source.exists():
+    raise SystemExit(f"Hermes Mem patch asset is missing: {youtube_routing_test_source}")
+youtube_routing_test_target.parent.mkdir(parents=True, exist_ok=True)
+youtube_routing_test_target.write_text(
+    youtube_routing_test_source.read_text(encoding="utf-8"),
+    encoding="utf-8",
+)
+
+toolsets_path = hermes_root / "toolsets.py"
+toolsets_text = toolsets_path.read_text(encoding="utf-8")
+video_start = toolsets_text.index('    "video": {')
+video_end = toolsets_text.index('    "image_gen": {', video_start)
+video_block = toolsets_text[video_start:video_end]
+video_block, video_tool_count = re.subn(
+    r'        "tools": \[[^\n]*\],',
+    '        "tools": ["video_analyze", "youtube_transcript"],',
+    video_block,
+    count=1,
+)
+if video_tool_count != 1:
+    raise SystemExit("Hermes Mem could not locate the video toolset tools")
+toolsets_text = toolsets_text[:video_start] + video_block + toolsets_text[video_end:]
+
+acp_start = toolsets_text.index('    "hermes-acp": {')
+acp_end = toolsets_text.index('    "hermes-api-server": {', acp_start)
+acp_block = toolsets_text[acp_start:acp_end]
+acp_block = acp_block.replace('            "youtube_analyze",\n', "")
+if '"youtube_transcript"' not in acp_block:
+    acp_vision_entry = '            "vision_analyze",\n'
+    if acp_vision_entry not in acp_block:
+        raise SystemExit("Hermes Mem could not locate the ACP vision-tool seam")
+    acp_block = acp_block.replace(
+        acp_vision_entry,
+        acp_vision_entry + '            "youtube_transcript",\n',
+        1,
+    )
+toolsets_text = toolsets_text[:acp_start] + acp_block + toolsets_text[acp_end:]
+toolsets_path.write_text(toolsets_text, encoding="utf-8")
+
+# Hermes Mem handles YouTube links in turn_context before the model is called.
+# Remove the upstream skill entirely so the model cannot redundantly inspect it,
+# execute its scripts, open a browser, or choose a second analysis path.
+youtube_skill_directories = [
+    hermes_root / "skills/media/youtube-content",
+]
+configured_hermes_home = os.environ.get("HERMES_HOME", "").strip()
+if configured_hermes_home:
+    youtube_skill_directories.append(
+        Path(configured_hermes_home) / "skills/media/youtube-content"
+    )
+for youtube_skill_directory in youtube_skill_directories:
+    if youtube_skill_directory.is_dir():
+        shutil.rmtree(youtube_skill_directory)
+
+turn_context_path = hermes_root / "agent/turn_context.py"
+turn_context_text = turn_context_path.read_text(encoding="utf-8")
+if "prefetch_memory_context(agent, original_user_message)" not in turn_context_text:
+    old_prefetch = '''    if agent._memory_manager:
+        try:
+            _query = original_user_message if isinstance(original_user_message, str) else ""
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+        except Exception:
+            pass
+'''
+    new_prefetch = old_prefetch + '''
+    # Hermes Mem: retrieval is a code-level invariant, not a model tool choice.
+    # Temporary chats have their Hermes Memory tools removed, so the helper
+    # returns an empty string and no private data is read.
+    try:
+        from agent.hermes_mem_autocapture import prefetch_memory_context
+        _hermes_mem_context = prefetch_memory_context(agent, original_user_message)
+        if _hermes_mem_context:
+            ext_prefetch_cache = (
+                ext_prefetch_cache + "\\n\\n" + _hermes_mem_context
+                if ext_prefetch_cache
+                else _hermes_mem_context
+            )
+    except Exception:
+        logger.warning("Hermes Mem automatic prefetch bridge failed", exc_info=True)
+'''
+    if old_prefetch not in turn_context_text:
+        raise SystemExit("Hermes Mem could not locate the turn-context prefetch seam")
+    turn_context_text = turn_context_text.replace(old_prefetch, new_prefetch, 1)
+if "prefetch_youtube_context(original_user_message)" not in turn_context_text:
+    youtube_prefetch_bridge = '''
+    # Hermes Mem: public YouTube subtitles are fetched before the main model
+    # answers. This is deterministic and never invokes an auxiliary model.
+    try:
+        from agent.hermes_youtube_transcript import prefetch_youtube_context
+        _hermes_youtube_context = prefetch_youtube_context(original_user_message)
+        if _hermes_youtube_context:
+            ext_prefetch_cache = (
+                ext_prefetch_cache + "\\n\\n" + _hermes_youtube_context
+                if ext_prefetch_cache
+                else _hermes_youtube_context
+            )
+    except Exception:
+        logger.warning("Hermes Mem automatic YouTube subtitle fetch failed", exc_info=True)
+'''
+    memory_bridge_marker = '''    except Exception:
+        logger.warning("Hermes Mem automatic prefetch bridge failed", exc_info=True)
+'''
+    if memory_bridge_marker not in turn_context_text:
+        raise SystemExit("Hermes Mem could not locate the automatic prefetch bridge")
+    turn_context_text = turn_context_text.replace(
+        memory_bridge_marker,
+        memory_bridge_marker + youtube_prefetch_bridge,
+        1,
+    )
+turn_context_path.write_text(turn_context_text, encoding="utf-8")
+
+turn_finalizer_path = hermes_root / "agent/turn_finalizer.py"
+turn_finalizer_text = turn_finalizer_path.read_text(encoding="utf-8")
+if "capture_completed_turn(" not in turn_finalizer_text:
+    post_hook_end = '''        except Exception as exc:
+            logger.warning("post_llm_call hook failed: %s", exc)
+'''
+    capture_block = post_hook_end + '''
+    # Hermes Mem: exact capture is guaranteed by the response finalizer instead
+    # of depending on the chat model to remember an MCP tool call. The helper
+    # also starts a fail-open background semantic consolidation.
+    if final_response and not interrupted:
+        try:
+            from agent.hermes_mem_autocapture import capture_completed_turn
+            capture_completed_turn(
+                agent,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                user_message=original_user_message,
+                assistant_response=final_response,
+            )
+        except Exception:
+            logger.warning("Hermes Mem automatic capture bridge failed", exc_info=True)
+'''
+    if post_hook_end not in turn_finalizer_text:
+        raise SystemExit("Hermes Mem could not locate the turn-finalizer capture seam")
+    turn_finalizer_text = turn_finalizer_text.replace(post_hook_end, capture_block, 1)
+turn_finalizer_path.write_text(turn_finalizer_text, encoding="utf-8")
+
 required_markers = [
     (mem_settings, "export function MemSettings"),
     (mem_settings, "<MemoryDashboardSettings />"),
+    (mem_settings, "web', 'search_backend"),
+    (mem_settings, "SEARXNG_URL"),
+    (mem_settings, "DuckDuckGo"),
     (memory_dashboard_settings, "export function MemoryDashboardSettings"),
     (memory_dashboard_settings, "DELETE_ALL_MEMORY"),
     (hidden_panels, "export function HiddenPanelsSettings"),
@@ -3195,6 +3533,18 @@ required_markers = [
     (acp_server, "_disable_hermes_memory_tools"),
     (tui_privacy_test, "test_temporary_agent_factory_accepts_privacy_flags"),
     (styles, "MEM readable UI scale"),
+    (autocapture_target, "def capture_completed_turn("),
+    (youtube_context_target, "def prefetch_youtube_context("),
+    (youtube_tool_target, 'name="youtube_transcript"'),
+    (toolsets_path, '"tools": ["video_analyze", "youtube_transcript"]'),
+    (toolsets_path, '"youtube_transcript",\n            "skills_list"'),
+    (
+        youtube_routing_test_target,
+        "def test_acp_session_exposes_youtube_transcript",
+    ),
+    (turn_context_path, "prefetch_memory_context(agent, original_user_message)"),
+    (turn_context_path, "prefetch_youtube_context(original_user_message)"),
+    (turn_finalizer_path, "capture_completed_turn("),
 ]
 if electron_main.exists():
     required_markers.append((electron_main, "hermes:memory:dashboard"))

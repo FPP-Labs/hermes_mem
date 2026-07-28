@@ -15,6 +15,13 @@ def _print(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _read_stdin_object() -> dict[str, Any]:
+    payload = json.load(sys.stdin)
+    if not isinstance(payload, dict):
+        raise ValueError("stdin must contain one JSON object")
+    return payload
+
+
 def _config_from_args(args: argparse.Namespace) -> MemoryConfig:
     config_path = Path(args.config).expanduser() if getattr(args, "config", None) else default_config_path()
     config = MemoryConfig.load(config_path)
@@ -22,6 +29,7 @@ def _config_from_args(args: argparse.Namespace) -> MemoryConfig:
         config = MemoryConfig(
             db_path=Path(args.db).expanduser(),
             timezone=config.timezone,
+            exact_retention_days=config.exact_retention_days,
             detailed_retention_days=config.detailed_retention_days,
             chat_retention_days=config.chat_retention_days,
             gradual_delete_chars=config.gradual_delete_chars,
@@ -59,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
     save.add_argument("--day")
     save.add_argument("--event-id", action="append", dest="event_ids")
     save.add_argument("--fact", action="append", dest="forever_facts")
+
+    sub.add_parser("auto-capture", help="Read a completed exact turn as JSON from stdin")
+    sub.add_parser("apply-review", help="Read a semantic turn review as JSON from stdin")
+
+    pending_reviews = sub.add_parser("pending-reviews", help="List exact turns awaiting semantic review")
+    pending_reviews.add_argument("--limit", type=int, default=3)
+
+    exact_search = sub.add_parser("search-exact", help="Search the active verbatim turn archive")
+    exact_search.add_argument("query")
+    exact_search.add_argument("--limit", type=int, default=8)
 
     append = sub.add_parser("append-day", help="Append detailed text to a day")
     append.add_argument("text")
@@ -214,6 +232,19 @@ def main(argv: list[str] | None = None) -> int:
                     forever_facts=args.forever_facts,
                 )
             )
+        elif args.command == "auto-capture":
+            _print(store.archive_exact_turn(**_read_stdin_object()))
+        elif args.command == "apply-review":
+            _print(store.apply_turn_review(**_read_stdin_object()))
+        elif args.command == "pending-reviews":
+            pending = [
+                item
+                for item in store.list_exact_turns(limit=args.limit)
+                if item["review_status"] == "pending"
+            ]
+            _print(pending)
+        elif args.command == "search-exact":
+            _print(store.search_exact_quotes(args.query, limit=args.limit))
         elif args.command == "append-day":
             _print(
                 store.append_day_memory(

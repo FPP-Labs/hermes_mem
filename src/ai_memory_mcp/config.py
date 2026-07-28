@@ -66,6 +66,7 @@ def _read_toml(path: Path) -> dict[str, object]:
 class MemoryConfig:
     db_path: Path
     timezone: str = "UTC"
+    exact_retention_days: int = 10
     detailed_retention_days: int = 10
     chat_retention_days: int = 10
     gradual_delete_chars: int = 20_000
@@ -87,6 +88,7 @@ class MemoryConfig:
         return cls(
             db_path=db_path,
             timezone=timezone,
+            exact_retention_days=int(raw.get("exact_retention_days", 10)),
             detailed_retention_days=int(raw.get("detailed_retention_days", 10)),
             chat_retention_days=int(raw.get("chat_retention_days", 10)),
             gradual_delete_chars=int(raw.get("gradual_delete_chars", 20_000)),
@@ -112,6 +114,7 @@ def write_default_config(path: Path | None = None, *, overwrite: bool = False) -
             [
                 f'db_path = "{default_db_path()}"',
                 'timezone = "UTC"',
+                "exact_retention_days = 10",
                 "detailed_retention_days = 10",
                 "chat_retention_days = 10",
                 "gradual_delete_chars = 20000",

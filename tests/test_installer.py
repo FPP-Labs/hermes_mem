@@ -19,7 +19,7 @@ def run_installer(
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "AI_MEMORY_PLATFORM": platform}
-    env["HERMES_MEM_LATEST_VERSION"] = "0.1.0b1"
+    env["HERMES_MEM_LATEST_VERSION"] = "0.2.0b1"
     if home is not None:
         env["HOME"] = str(home)
     return subprocess.run(
@@ -48,7 +48,7 @@ def test_help_exposes_only_the_three_actions() -> None:
         assert old_command not in result.stdout
 
 
-def make_installed(home: Path, version: str = "0.1.0b1", directory: str = ".hermes-mem") -> Path:
+def make_installed(home: Path, version: str = "0.2.0b1", directory: str = ".hermes-mem") -> Path:
     mem_home = home / directory
     (mem_home / "hermes/hermes-agent").mkdir(parents=True)
     (mem_home / "memory").mkdir()
@@ -70,7 +70,7 @@ def test_install_reports_when_already_installed(tmp_path: Path) -> None:
     make_installed(tmp_path)
     result = run_installer(home=tmp_path, input_text="1\n")
     assert result.returncode == 0, result.stderr
-    assert "Hermes Mem Beta 0.1 is already installed." in result.stdout
+    assert "Hermes Mem Beta 0.2 is already installed." in result.stdout
 
 
 def test_delete_reports_when_not_installed(tmp_path: Path) -> None:
@@ -89,7 +89,65 @@ def test_update_reports_latest_version_without_network(tmp_path: Path) -> None:
     make_installed(tmp_path)
     result = run_installer(home=tmp_path, input_text="3\n")
     assert result.returncode == 0, result.stderr
-    assert "already on the latest version: Beta 0.1 (0.1.0b1)" in result.stdout
+    assert "already on the latest version: Beta 0.2 (0.2.0b1)" in result.stdout
+
+
+def run_update_decision_probe(
+    tmp_path: Path,
+    *,
+    installed_version: str,
+    online_version: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    probe_installer = tmp_path / "install-probe.sh"
+    installer_text = INSTALLER.read_text(encoding="utf-8")
+    marker = "    update_flow\n    ;;\n"
+    assert installer_text.count(marker) == 1
+    probe_installer.write_text(
+        installer_text.replace(marker, "    printf 'PROBE_UPDATE_FLOW\\n'\n    ;;\n"),
+        encoding="utf-8",
+    )
+    mem_home = make_installed(tmp_path, version=installed_version)
+    db = mem_home / "memory/memory.sqlite3"
+    db.write_text("preserve-memory", encoding="utf-8")
+    env = {
+        **os.environ,
+        "AI_MEMORY_PLATFORM": "Darwin",
+        "HERMES_MEM_LATEST_VERSION": online_version,
+        "HOME": str(tmp_path),
+    }
+    result = subprocess.run(
+        ["bash", str(probe_installer), "update"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, db
+
+
+def test_update_prefers_a_newer_local_beta_without_touching_memory(tmp_path: Path) -> None:
+    result, db = run_update_decision_probe(
+        tmp_path,
+        installed_version="0.1.0b1",
+        online_version="0.1.0b1",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Updating Hermes Mem from this folder: 0.1.0b1 -> Beta 0.2 (0.2.0b1)." in result.stdout
+    assert "PROBE_UPDATE_FLOW" in result.stdout
+    assert db.read_text(encoding="utf-8") == "preserve-memory"
+
+
+def test_update_refuses_to_downgrade_a_newer_install(tmp_path: Path) -> None:
+    result, db = run_update_decision_probe(
+        tmp_path,
+        installed_version="0.3.0b1",
+        online_version="0.2.0b1",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "newer than the online release 0.2.0b1; refusing to downgrade" in result.stdout
+    assert "PROBE_UPDATE_FLOW" not in result.stdout
+    assert db.read_text(encoding="utf-8") == "preserve-memory"
 
 
 def test_delete_requires_exact_phrase_and_only_removes_mem(tmp_path: Path) -> None:
@@ -151,6 +209,13 @@ def test_installer_and_package_versions_match() -> None:
     assert project_version.group(1) == package_version.group(1)
 
 
+def test_project_metadata_points_to_the_release_repository() -> None:
+    project_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'version = "0.2.0b1"' in project_text
+    assert 'readme = "README.md"' in project_text
+    assert project_text.count("https://github.com/FPP-Labs/hermes_mem") == 2
+
+
 def test_beta_brand_and_upstream_attribution_are_distributed() -> None:
     installer_text = INSTALLER.read_text(encoding="utf-8")
     patcher_text = UI_PATCHER.read_text(encoding="utf-8")
@@ -159,18 +224,18 @@ def test_beta_brand_and_upstream_attribution_are_distributed() -> None:
     license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     notice_text = (ROOT / "NOTICE").read_text(encoding="utf-8")
     assert "Hermes Mem" in installer_text
-    assert 'MEM_VERSION_LABEL="Beta 0.1"' in installer_text
-    assert 'package_data["version"] = "0.1.0-beta.1"' in patcher_text
+    assert 'MEM_VERSION_LABEL="Beta 0.2"' in installer_text
+    assert 'package_data["version"] = "0.2.0-beta.1"' in patcher_text
     assert 'build["appId"] = "app.hermesmem.desktop"' in patcher_text
     assert '"schemes": ["hermes-mem"]' in patcher_text
-    assert "FodorProPro/hermes_fpp" in installer_text
+    assert "FPP-Labs/hermes_mem" in installer_text
     assert '"const APP_NAME = \'Hermes Mem\'"' in patcher_text
     assert "return app.getVersion()" in patcher_text
     assert 'package_data["author"]' not in patcher_text
     assert 'build["copyright"]' not in patcher_text
     for text in (installer_text, patcher_text, project_text, soul_text, license_text, notice_text):
         assert "Nous Research" in text
-    assert "Hermes Mem Beta 0.1" in notice_text
+    assert "Hermes Mem Beta 0.2" in notice_text
     assert "not an official Nous Research product" in notice_text
 
 
@@ -195,6 +260,12 @@ def test_installer_repairs_desktop_dependencies_before_building() -> None:
     for dependency in ("@vitejs/plugin-react", "@tailwindcss/vite", "electron-builder"):
         assert dependency in text
     assert 'install --workspace apps/desktop --include=dev --no-audit --no-fund' in text
+    assert "node_command() {" in text
+    assert "npm_command() {" in text
+    assert 'command -v node 2>/dev/null' in text
+    assert 'command -v npm 2>/dev/null' in text
+    assert 'npm_bin="$(npm_command || true)"' in text
+    assert "Hermes-managed runtime or system PATH" in text
     assert "for attempt in 1 2 3 4 5 6" in text
     assert "--prefer-offline" in text
     assert "NPM_CONFIG_FETCH_RETRIES=10" in text
@@ -208,6 +279,84 @@ def test_installer_repairs_desktop_dependencies_before_building() -> None:
     assert "CI=1 \\" in text
     desktop_phase = text[text.index("desktop_build_phase() {") : text.index("launcher_phase() {")]
     assert desktop_phase.index("ensure_desktop_dependencies") < desktop_phase.index("apply_hermes_desktop_ui")
+
+
+def test_duckduckgo_search_is_installed_and_selected_by_default() -> None:
+    installer_text = INSTALLER.read_text(encoding="utf-8")
+    agent_phase = installer_text[installer_text.index("agent_phase() {") : installer_text.index("install_memory_phase() {")]
+    search_config = installer_text[
+        installer_text.index("configure_web_search() {") : installer_text.index("install_hermes_soul() {")
+    ]
+    assert 'DDGS_VERSION="9.14.4"' in installer_text
+    assert '"ddgs==$DDGS_VERSION"' in installer_text
+    assert "ensure_ddgs_dependency" in agent_phase
+    assert 'install_agent_python_package "ddgs==$DDGS_VERSION"' in installer_text
+    assert 'set_web_backend "ddgs"' in search_config
+
+
+def test_agent_dependencies_support_uv_venvs_without_pip() -> None:
+    installer_text = INSTALLER.read_text(encoding="utf-8")
+    helper = installer_text[
+        installer_text.index("install_agent_python_package() {") :
+        installer_text.index("ensure_ddgs_dependency() {")
+    ]
+    assert 'managed_uv="$HERMES_HOME/bin/uv"' in helper
+    assert '"$managed_uv" pip install' in helper
+    assert '--python "$python_bin"' in helper
+    assert '"$python_bin" -m ensurepip --upgrade' in helper
+    assert helper.index('"$managed_uv" pip install') < helper.index('"$python_bin" -m pip install')
+
+
+def test_youtube_understanding_dependency_tool_and_policy_are_distributed() -> None:
+    installer_text = INSTALLER.read_text(encoding="utf-8")
+    patcher_text = UI_PATCHER.read_text(encoding="utf-8")
+    soul_text = SOUL.read_text(encoding="utf-8")
+    agent_phase = installer_text[
+        installer_text.index("agent_phase() {") : installer_text.index("install_memory_phase() {")
+    ]
+
+    assert 'YOUTUBE_TRANSCRIPT_API_VERSION="1.2.4"' in installer_text
+    assert '"youtube-transcript-api==$YOUTUBE_TRANSCRIPT_API_VERSION"' in installer_text
+    assert "ensure_youtube_dependency" in agent_phase
+    assert 'install_agent_python_package "youtube-transcript-api==$YOUTUBE_TRANSCRIPT_API_VERSION"' in installer_text
+    assert 'patch_assets / "hermes_youtube_transcript_tool.py"' in patcher_text
+    assert 'hermes_root / "tools/hermes_youtube_transcript_tool.py"' in patcher_text
+    assert 'name="youtube_transcript"' in patcher_text
+    assert "prefetch_youtube_context(original_user_message)" in patcher_text
+    assert 'hermes_root / "skills/media/youtube-content"' in patcher_text
+    assert "shutil.rmtree(youtube_skill_directory)" in patcher_text
+    for text in (installer_text, soul_text):
+        assert "loaded automatically before the main model answers" in text
+        assert "transcript_only" in text
+        assert "untrusted source material" in text
+
+
+def test_mem_settings_expose_duckduckgo_and_searxng() -> None:
+    patcher_text = UI_PATCHER.read_text(encoding="utf-8")
+    for marker in (
+        "Search provider",
+        "DuckDuckGo",
+        "SearXNG server",
+        "SearXNG port",
+        "SEARXNG_URL",
+        "web', 'search_backend",
+    ):
+        assert marker in patcher_text
+
+
+def test_installer_never_prompts_for_voice_or_search_settings() -> None:
+    installer_text = INSTALLER.read_text(encoding="utf-8")
+    for forbidden_prompt in (
+        "ElevenLabs API key (",
+        "ElevenLabs voice id (",
+        "Web search API key",
+        "Web search provider [",
+        "SearXNG URL/IP",
+    ):
+        assert forbidden_prompt not in installer_text
+    assert "configure_elevenlabs" not in installer_text
+    assert "CONFIGURE_ELEVENLABS" not in installer_text
+    assert "CONFIGURE_WEB_SEARCH" not in installer_text
 
 
 def test_hermes_agent_is_pinned_to_the_tested_release() -> None:
@@ -302,7 +451,7 @@ def test_ui_patcher_enforces_the_cross_platform_mem_contract() -> None:
 
 def test_readme_has_one_command_install_and_release_safety_details() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "git clone https://github.com/FodorProPro/hermes_fpp.git && cd hermes_fpp && ./install.sh" in text
+    assert "git clone https://github.com/FPP-Labs/hermes_mem.git && cd hermes_mem && ./install.sh" in text
     assert "Hermes Agent `0.18.2`" in text
     assert "36f2a966c7f9f69987494b867c3dcf96b69a5766" in text
     assert "DELETE_ALL_MEMORY" in text
@@ -323,6 +472,35 @@ def test_prompt_follows_the_users_current_language() -> None:
         text = path.read_text(encoding="utf-8")
         for rule in required_rules:
             assert rule in text
+
+
+def test_prompt_documents_automatic_memory_quotes_and_preserves_unresolved_plans() -> None:
+    required_rules = (
+        "Relevant memory is loaded automatically",
+        "exact visible user/assistant turn is archived automatically",
+        "memory.search_exact_quotes",
+        "Only results marked as exact verbatim turns",
+        "Preserve negation, uncertainty, and modality exactly",
+        'use event_type "plan" and status "planned"; never invent a start date.',
+        "ask for an update instead of assuming it happened.",
+    )
+    for path in (SOUL, INSTALLER):
+        text = path.read_text(encoding="utf-8")
+        for rule in required_rules:
+            assert rule in text
+
+
+def test_desktop_patcher_installs_code_level_memory_read_and_write_bridges() -> None:
+    patcher = UI_PATCHER.read_text(encoding="utf-8")
+    bridge = (ROOT / "hermes-patches/hermes_mem_autocapture.py").read_text(encoding="utf-8")
+    assert "prefetch_memory_context(agent, original_user_message)" in patcher
+    assert "capture_completed_turn(" in patcher
+    assert "turn_finalizer.py" in patcher
+    assert "turn_context.py" in patcher
+    assert "def prefetch_memory_context(" in bridge
+    assert "def capture_completed_turn(" in bridge
+    assert "if not _memory_enabled(agent):" in bridge
+    assert "memory.search_exact_quotes" in SOUL.read_text(encoding="utf-8")
 
 
 def test_distributed_project_text_is_english_only() -> None:

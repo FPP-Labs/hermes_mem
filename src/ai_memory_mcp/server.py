@@ -13,11 +13,13 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
     mcp = FastMCP(
         "hermes-memory",
         instructions=(
-            "Hermes Memory MCP stores four layers: detailed rolling 10-day memory, "
-            "separate 10-day chat cards/notes, forever user facts, and forever "
-            "time-based events with links to memories and chats. "
-            "Hermes should call memory.get_context before model responses and "
-            "memory.save_turn after responses."
+            "Hermes Memory stores an automatic verbatim 10-day turn archive, "
+            "long-term schematic summaries, rolling day notes, permanent facts, "
+            "and time-based events. Automatic code captures and retrieves memory "
+            "even when the model does not call a tool. Only memory.search_exact_quotes "
+            "results are valid sources for direct quotations; summaries must never "
+            "be presented as verbatim speech. Preserve whether information is a fact, "
+            "preference, possibility, plan, work in progress, or completed action."
         ),
     )
 
@@ -46,15 +48,27 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
     @mcp.tool(name="memory.save_turn")
     def save_turn(
         user_message: str,
+        detailed_memory_text: str,
         assistant_message: str = "",
-        detailed_memory_text: str | None = None,
+        memory_kind: str = "observation",
+        memory_status: str = "confirmed",
         at: str | None = None,
         day: str | None = None,
         event_ids: list[str] | None = None,
         forever_facts: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Save one Hermes conversation turn and append it to detailed day memory."""
+        """Save every user turn as a concise original summary before the final answer.
+
+        detailed_memory_text must paraphrase the useful meaning instead of copying
+        the raw conversation. memory_kind and memory_status must preserve modality:
+        a wish, possibility, or plan is not a confirmed present fact.
+        """
+        enriched_metadata = {
+            "memory_kind": memory_kind.strip() or "observation",
+            "memory_status": memory_status.strip() or "confirmed",
+            **(metadata or {}),
+        }
         return store.save_turn(
             user_message=user_message,
             assistant_message=assistant_message,
@@ -63,7 +77,7 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
             day=day,
             event_ids=event_ids,
             forever_facts=forever_facts,
-            metadata=metadata,
+            metadata=enriched_metadata,
         )
 
     @mcp.tool(name="memory.append_day_memory")
@@ -142,7 +156,11 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
         metadata: dict[str, Any] | None = None,
         auto_link_existing: bool = True,
     ) -> dict[str, Any]:
-        """Create a permanent time-based event such as a 10-day trip."""
+        """Create a time-based event or unresolved plan.
+
+        For a wish or future intention with no known date, use event_type="plan"
+        and status="planned". Do not supply an invented start_at value.
+        """
         return store.create_event(
             title=title,
             event_type=event_type,
@@ -190,6 +208,11 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
     def active_events(at: str | None = None) -> list[dict[str, Any]]:
         """List events active at the given time or now."""
         return store.active_events(at=at)
+
+    @mcp.tool(name="memory.open_events")
+    def open_events(at: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """List active events plus unresolved plans, possibilities, and upcoming events."""
+        return store.open_events(at=at, limit=limit)
 
     @mcp.tool(name="memory.get_event_context")
     def get_event_context(event_id: str, query: str = "", max_chars: int | None = None) -> dict[str, Any]:
@@ -279,8 +302,18 @@ def create_mcp_server(config: MemoryConfig | None = None) -> FastMCP:
 
     @mcp.tool(name="memory.search")
     def search(query: str, limit: int | None = None) -> list[dict[str, Any]]:
-        """Search detailed days, chat cards/notes, forever facts, events, and event traces."""
+        """Search exact turns, summaries, detailed days, facts, chats, and events."""
         return store.search(query, limit=limit)
+
+    @mcp.tool(name="memory.search_exact_quotes")
+    def search_exact_quotes(query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Search only the active 10-day verbatim archive for exact quotations."""
+        return store.search_exact_quotes(query, limit=limit)
+
+    @mcp.tool(name="memory.recent_exact_turns")
+    def recent_exact_turns(limit: int = 3) -> list[dict[str, Any]]:
+        """Return the most recent complete 10-day turns as exact quotations."""
+        return store.recent_exact_quotes(limit=limit)
 
     @mcp.tool(name="memory.forget_memory")
     def forget_memory(memory_id: str) -> dict[str, Any]:

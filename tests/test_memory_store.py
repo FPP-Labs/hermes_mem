@@ -14,6 +14,7 @@ def make_store(tmp_path: Path, *, delete_chars: int = 100_000) -> MemoryStore:
         MemoryConfig(
             db_path=tmp_path / "memory.sqlite3",
             timezone="UTC",
+            exact_retention_days=10,
             detailed_retention_days=10,
             chat_retention_days=10,
             gradual_delete_chars=delete_chars,
@@ -213,5 +214,239 @@ def test_clear_all_memory_requires_confirmation_and_clears_every_layer(tmp_path:
         assert store.list_chat_sessions() == []
         assert store.search("detail") == []
         assert all(value == 0 for key, value in store.doctor().items() if key in result["previous_counts"])
+    finally:
+        store.close()
+
+
+def test_turn_summary_keeps_exact_time_and_semantic_status_in_context_and_search(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        saved = store.save_turn(
+            user_message="I want to build my own x86 server soon.",
+            assistant_message="Understood.",
+            detailed_memory_text=(
+                "The user plans to build an x86 server in the future; "
+                "the server has not been built yet."
+            ),
+            at="2026-07-27T14:35:12+00:00",
+            metadata={"memory_kind": "plan", "memory_status": "planned"},
+        )
+
+        detailed = store.get_10_day_detailed_memory(today="2026-07-27")
+        marker = "27.07.2026 14:35:12 UTC | kind=plan | status=planned"
+        assert marker in detailed["context_text"]
+        assert "has not been built yet" in detailed["context_text"]
+        chunk = detailed["days"][0]["chunks"][0]
+        assert chunk["id"] == saved["chunk"]["id"]
+        assert chunk["metadata"]["memory_kind"] == "plan"
+        assert chunk["metadata"]["memory_status"] == "planned"
+
+        context = store.get_context(query="x86 server", at="2026-07-28T09:00:00+00:00")
+        assert f"[day_chunk | {marker}]" in context["context_text"]
+        preview = next(item for item in context["search_results_preview"] if item["type"] == "day_chunk")
+        assert preview["created_at"] == "2026-07-27T14:35:12+00:00"
+    finally:
+        store.close()
+
+
+def test_exact_turn_archive_is_idempotent_searchable_and_quote_safe(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        now = datetime.now(ZoneInfo("UTC")).replace(microsecond=0)
+        archived = store.archive_exact_turn(
+            external_turn_id="session-1:turn-1",
+            session_id="session-1",
+            task_id="task-1",
+            user_message="  I want to build an x86 server soon.\n",
+            assistant_message="I understood that this is a future plan.\n",
+            user_created_at=now.isoformat(timespec="seconds"),
+            assistant_created_at=(now + timedelta(seconds=8)).isoformat(timespec="seconds"),
+            model="test-model",
+            platform="desktop",
+        )
+        duplicate = store.archive_exact_turn(
+            external_turn_id="session-1:turn-1",
+            user_message="This must not overwrite the original.",
+            assistant_message="Nor this.",
+        )
+
+        assert archived["duplicate"] is False
+        assert duplicate["duplicate"] is True
+        assert duplicate["id"] == archived["id"]
+        assert duplicate["user_message"] == "  I want to build an x86 server soon.\n"
+
+        quotes = store.search_exact_quotes("x86 server")
+        assert len(quotes) == 1
+        assert quotes[0]["verbatim"] is True
+        assert quotes[0]["user_quote"] == "  I want to build an x86 server soon.\n"
+        assert quotes[0]["assistant_quote"] == "I understood that this is a future plan.\n"
+
+        context = store.get_context(query="x86 server")
+        assert "exact verbatim turn" in context["context_text"]
+        assert "User exact quote [" in context["context_text"]
+        assert "I want to build an x86 server soon." in context["context_text"]
+        assert "Only entries marked 'exact verbatim turn'" in context["context_text"]
+
+        continuity = store.get_context(query="zzzxxyyqq")
+        assert "Most recent complete verbatim turns" in continuity["context_text"]
+        assert "I want to build an x86 server soon." in continuity["context_text"]
+    finally:
+        store.close()
+
+
+def test_semantic_review_preserves_plan_status_and_rotates_only_exact_text(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        created = datetime.now(ZoneInfo("UTC")).replace(microsecond=0)
+        archived = store.archive_exact_turn(
+            external_turn_id="session-2:turn-1",
+            user_message="I want to build my own x86 server soon.",
+            assistant_message="That is still a plan.",
+            assistant_created_at=created.isoformat(timespec="seconds"),
+        )
+        review = store.apply_turn_review(
+            exact_turn_id=archived["id"],
+            summary="The user plans to build an x86 server; it does not exist yet.",
+            keep_long_term=True,
+            memory_kind="plan",
+            memory_status="planned",
+            importance=8,
+            events=[
+                {
+                    "title": "Build an x86 server",
+                    "event_type": "plan",
+                    "description": "The server is planned and has not been built.",
+                    "start_at": None,
+                    "status": "planned",
+                    "importance": 8,
+                }
+            ],
+        )
+
+        assert review["review_status"] == "reviewed"
+        summary = store.list_turn_consolidations()[0]
+        assert summary["memory_kind"] == "plan"
+        assert summary["memory_status"] == "planned"
+        event = store.list_events()[0]
+        assert event["status"] == "planned"
+        assert event["start_at"] is None
+
+        rotation = store.rotate_exact_turns(
+            at=(created + timedelta(days=11)).isoformat(timespec="seconds")
+        )
+        assert rotation["deleted_count"] == 1
+        assert store.search_exact_quotes("x86 server") == []
+        long_term = store.search("x86 server", limit=10)
+        assert any(item["type"] == "turn_consolidation" for item in long_term)
+        assert any(item["type"] == "event" and item["status"] == "planned" for item in long_term)
+    finally:
+        store.close()
+
+
+def test_expired_exact_turn_waits_for_successful_review_instead_of_being_lost(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        created = datetime.now(ZoneInfo("UTC")).replace(microsecond=0)
+        archived = store.archive_exact_turn(
+            external_turn_id="session-3:turn-1",
+            user_message="A memory review provider may be temporarily unavailable.",
+            assistant_message="The exact source must survive until retry.",
+            assistant_created_at=created.isoformat(timespec="seconds"),
+        )
+        rotation = store.rotate_exact_turns(
+            at=(created + timedelta(days=11)).isoformat(timespec="seconds")
+        )
+
+        assert rotation["deleted_count"] == 0
+        assert rotation["expired_pending_review_count"] == 1
+        assert store.get_exact_turn(archived["id"])["deleted_at"] is None
+    finally:
+        store.close()
+
+
+def test_automatic_reviews_deduplicate_stable_facts_and_repeated_plans(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        for index in (1, 2):
+            archived = store.archive_exact_turn(
+                external_turn_id=f"session-dedupe:turn-{index}",
+                user_message="I prefer Linux and still plan to build an x86 server.",
+                assistant_message="The server remains a plan.",
+            )
+            store.apply_turn_review(
+                exact_turn_id=archived["id"],
+                summary="The user prefers Linux and plans an x86 server.",
+                keep_long_term=True,
+                memory_kind="plan",
+                memory_status="planned",
+                importance=8,
+                facts=[
+                    {
+                        "text": "The user prefers Linux.",
+                        "category": "preference",
+                        "importance": 8,
+                    }
+                ],
+                events=[
+                    {
+                        "title": "Build an x86 server",
+                        "event_type": "plan",
+                        "description": "The server is not built yet.",
+                        "status": "planned",
+                        "importance": 8,
+                    }
+                ],
+            )
+
+        assert len(store.list_forever_facts()) == 1
+        assert len(store.list_events()) == 1
+        event = store.list_events()[0]
+        assert event["status"] == "planned"
+        links = store.conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM event_memory_links
+            WHERE event_id = ? AND memory_type = 'exact_turn'
+            """,
+            (event["id"],),
+        ).fetchone()
+        assert links["count"] == 2
+    finally:
+        store.close()
+
+
+def test_undated_plan_stays_unresolved_until_explicitly_updated(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        plan = store.create_event(
+            title="Build an x86 server",
+            event_type="plan",
+            description="The user wants to build an x86 server in the future.",
+        )
+
+        assert plan["start_at"] is None
+        assert plan["end_at"] is None
+        assert plan["status"] == "planned"
+        assert plan["computed_status"] == "planned"
+        assert plan["temporal_status"] == "unknown"
+        assert store.active_events() == []
+        assert [event["id"] for event in store.open_events()] == [plan["id"]]
+
+        context = store.get_context(query="")
+        assert "Current events and unresolved plans:" in context["context_text"]
+        assert "Build an x86 server" in context["context_text"]
+        assert "schedule=unknown" in context["context_text"]
+        assert "status=planned" in context["context_text"]
+
+        in_progress = store.update_event(
+            plan["id"],
+            status="in_progress",
+            start_at="2026-07-28T10:00:00+00:00",
+        )
+        assert in_progress["computed_status"] == "in_progress"
+        assert [event["id"] for event in store.active_events(at="2026-07-28T11:00:00+00:00")] == [plan["id"]]
+
+        completed = store.update_event(plan["id"], status="completed")
+        assert completed["computed_status"] == "completed"
+        assert store.open_events(at="2026-07-28T11:00:00+00:00") == []
     finally:
         store.close()
