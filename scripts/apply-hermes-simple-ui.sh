@@ -58,7 +58,7 @@ patch_assets = Path(sys.argv[2])
 
 package_json = desktop / "package.json"
 package_data = json.loads(package_json.read_text(encoding="utf-8"))
-package_data["version"] = "0.2.0-beta.1"
+package_data["version"] = "0.2.0-beta.11"
 package_data["productName"] = "Hermes Mem"
 package_data["description"] = "Independent community edition based on Hermes Agent by Nous Research."
 build = package_data.setdefault("build", {})
@@ -3369,6 +3369,19 @@ youtube_tool_target.write_text(youtube_tool_source.read_text(encoding="utf-8"), 
 legacy_youtube_tool = hermes_root / "tools/hermes_youtube_analyze_tool.py"
 legacy_youtube_tool.unlink(missing_ok=True)
 
+ddgs_provider_source = patch_assets / "hermes_ddgs_provider.py"
+ddgs_provider_target = hermes_root / "plugins/web/ddgs/provider.py"
+if not ddgs_provider_source.exists():
+    raise SystemExit(f"Hermes Mem patch asset is missing: {ddgs_provider_source}")
+if not ddgs_provider_target.parent.is_dir():
+    raise SystemExit(
+        f"Hermes Mem could not locate the Hermes DDGS provider: {ddgs_provider_target}"
+    )
+ddgs_provider_target.write_text(
+    ddgs_provider_source.read_text(encoding="utf-8"),
+    encoding="utf-8",
+)
+
 youtube_routing_test_source = patch_assets / "hermes_youtube_routing_regression.py"
 youtube_routing_test_target = hermes_root / "tests/tui_gateway/test_mem_youtube_routing.py"
 if not youtube_routing_test_source.exists():
@@ -3536,6 +3549,8 @@ required_markers = [
     (autocapture_target, "def capture_completed_turn("),
     (youtube_context_target, "def prefetch_youtube_context("),
     (youtube_tool_target, 'name="youtube_transcript"'),
+    (ddgs_provider_target, 'dns_resolver="system"'),
+    (ddgs_provider_target, "def _run_html_fallback("),
     (toolsets_path, '"tools": ["video_analyze", "youtube_transcript"]'),
     (toolsets_path, '"youtube_transcript",\n            "skills_list"'),
     (

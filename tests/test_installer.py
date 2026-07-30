@@ -19,7 +19,7 @@ def run_installer(
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "AI_MEMORY_PLATFORM": platform}
-    env["HERMES_MEM_LATEST_VERSION"] = "0.2.0b1"
+    env["HERMES_MEM_LATEST_VERSION"] = "0.2.0b11"
     if home is not None:
         env["HOME"] = str(home)
     return subprocess.run(
@@ -48,7 +48,7 @@ def test_help_exposes_only_the_three_actions() -> None:
         assert old_command not in result.stdout
 
 
-def make_installed(home: Path, version: str = "0.2.0b1", directory: str = ".hermes-mem") -> Path:
+def make_installed(home: Path, version: str = "0.2.0b11", directory: str = ".hermes-mem") -> Path:
     mem_home = home / directory
     (mem_home / "hermes/hermes-agent").mkdir(parents=True)
     (mem_home / "memory").mkdir()
@@ -89,7 +89,7 @@ def test_update_reports_latest_version_without_network(tmp_path: Path) -> None:
     make_installed(tmp_path)
     result = run_installer(home=tmp_path, input_text="3\n")
     assert result.returncode == 0, result.stderr
-    assert "already on the latest version: Beta 0.2 (0.2.0b1)" in result.stdout
+    assert "already on the latest version: Beta 0.2 (0.2.0b11)" in result.stdout
 
 
 def run_update_decision_probe(
@@ -133,7 +133,24 @@ def test_update_prefers_a_newer_local_beta_without_touching_memory(tmp_path: Pat
         online_version="0.1.0b1",
     )
     assert result.returncode == 0, result.stderr
-    assert "Updating Hermes Mem from this folder: 0.1.0b1 -> Beta 0.2 (0.2.0b1)." in result.stdout
+    assert "Updating Hermes Mem from this folder: 0.1.0b1 -> Beta 0.2 (0.2.0b11)." in result.stdout
+    assert "PROBE_UPDATE_FLOW" in result.stdout
+    assert db.read_text(encoding="utf-8") == "preserve-memory"
+
+
+def test_beta_02_b10_can_update_to_search_hotfix_without_touching_memory(
+    tmp_path: Path,
+) -> None:
+    result, db = run_update_decision_probe(
+        tmp_path,
+        installed_version="0.2.0b10",
+        online_version="0.2.0b10",
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        "Updating Hermes Mem from this folder: 0.2.0b10 -> "
+        "Beta 0.2 (0.2.0b11)."
+    ) in result.stdout
     assert "PROBE_UPDATE_FLOW" in result.stdout
     assert db.read_text(encoding="utf-8") == "preserve-memory"
 
@@ -142,10 +159,10 @@ def test_update_refuses_to_downgrade_a_newer_install(tmp_path: Path) -> None:
     result, db = run_update_decision_probe(
         tmp_path,
         installed_version="0.3.0b1",
-        online_version="0.2.0b1",
+        online_version="0.2.0b11",
     )
     assert result.returncode == 0, result.stderr
-    assert "newer than the online release 0.2.0b1; refusing to downgrade" in result.stdout
+    assert "newer than the online release 0.2.0b11; refusing to downgrade" in result.stdout
     assert "PROBE_UPDATE_FLOW" not in result.stdout
     assert db.read_text(encoding="utf-8") == "preserve-memory"
 
@@ -211,7 +228,7 @@ def test_installer_and_package_versions_match() -> None:
 
 def test_project_metadata_points_to_the_release_repository() -> None:
     project_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "0.2.0b1"' in project_text
+    assert 'version = "0.2.0b11"' in project_text
     assert 'readme = "README.md"' in project_text
     assert project_text.count("https://github.com/FPP-Labs/hermes_mem") == 2
 
@@ -225,7 +242,7 @@ def test_beta_brand_and_upstream_attribution_are_distributed() -> None:
     notice_text = (ROOT / "NOTICE").read_text(encoding="utf-8")
     assert "Hermes Mem" in installer_text
     assert 'MEM_VERSION_LABEL="Beta 0.2"' in installer_text
-    assert 'package_data["version"] = "0.2.0-beta.1"' in patcher_text
+    assert 'package_data["version"] = "0.2.0-beta.11"' in patcher_text
     assert 'build["appId"] = "app.hermesmem.desktop"' in patcher_text
     assert '"schemes": ["hermes-mem"]' in patcher_text
     assert "FPP-Labs/hermes_mem" in installer_text
@@ -283,6 +300,10 @@ def test_installer_repairs_desktop_dependencies_before_building() -> None:
 
 def test_duckduckgo_search_is_installed_and_selected_by_default() -> None:
     installer_text = INSTALLER.read_text(encoding="utf-8")
+    patcher_text = UI_PATCHER.read_text(encoding="utf-8")
+    provider_text = (ROOT / "hermes-patches/hermes_ddgs_provider.py").read_text(
+        encoding="utf-8"
+    )
     agent_phase = installer_text[installer_text.index("agent_phase() {") : installer_text.index("install_memory_phase() {")]
     search_config = installer_text[
         installer_text.index("configure_web_search() {") : installer_text.index("install_hermes_soul() {")
@@ -292,6 +313,10 @@ def test_duckduckgo_search_is_installed_and_selected_by_default() -> None:
     assert "ensure_ddgs_dependency" in agent_phase
     assert 'install_agent_python_package "ddgs==$DDGS_VERSION"' in installer_text
     assert 'set_web_backend "ddgs"' in search_config
+    assert 'patch_assets / "hermes_ddgs_provider.py"' in patcher_text
+    assert 'hermes_root / "plugins/web/ddgs/provider.py"' in patcher_text
+    assert 'dns_resolver="system"' in provider_text
+    assert "def _run_html_fallback(" in provider_text
 
 
 def test_agent_dependencies_support_uv_venvs_without_pip() -> None:

@@ -2,6 +2,17 @@
 
 All notable changes to Hermes Mem are documented in this file.
 
+## [0.2.0b11] - 2026-07-30
+
+### Fixed
+
+- Forced DDGS/Primp to use the operating system DNS resolver, preventing web
+  search from breaking after sleep, Wi-Fi, VPN, or DNS network transitions.
+- Added a keyless DuckDuckGo HTML fallback through `httpx` when the primary
+  DDGS client still times out or fails.
+- Made the search repair part of both installation and update while preserving
+  existing chats, memory, and settings.
+
 ## [0.2.0b1] - 2026-07-28
 
 Hermes Mem Beta 0.2 is based on the tested Hermes Agent 0.18.2 source pinned

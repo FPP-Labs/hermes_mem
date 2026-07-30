@@ -4,7 +4,7 @@ Hermes Mem is an independent community fork of [Hermes Agent](https://github.com
 
 Hermes Mem Beta 0.2 uses the tested Hermes Agent `0.18.2` build pinned to commit `36f2a966c7f9f69987494b867c3dcf96b69a5766`. New upstream changes are not downloaded automatically.
 
-Release version: `0.2.0b1`. See [CHANGELOG.md](CHANGELOG.md) for the Beta 0.2 release notes.
+Release version: `0.2.0b11`. See [CHANGELOG.md](CHANGELOG.md) for the Beta 0.2 release notes.
 
 ## Install
 
